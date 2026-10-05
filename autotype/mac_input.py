@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ctypes
 import time
+from contextlib import contextmanager
+from functools import lru_cache
 from ctypes import c_int, c_uint16, c_uint32, c_void_p
 
 _CG = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
@@ -52,9 +54,13 @@ _CF = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFound
 _CF.CFRelease.argtypes = [c_void_p]
 
 def _post(keycode: int, down: bool, flags: int = 0) -> None:
+    if hasattr(_CG, "CGPreflightPostEventAccess"):
+        _CG.CGPreflightPostEventAccess.restype = ctypes.c_bool
+        if not _CG.CGPreflightPostEventAccess():
+            raise PermissionError("Allow Accessibility for Python or Terminal in macOS Settings")
     event = _CG.CGEventCreateKeyboardEvent(None, c_uint16(keycode), c_int(1 if down else 0))
     if not event:
-        return
+        raise OSError("macOS couldn't create a keyboard event")
     if flags:
         _CG.CGEventSetFlags(event, c_uint32(flags))
     _CG.CGEventPost(c_uint32(_HID), event)
@@ -86,6 +92,7 @@ def press_enter() -> None:
     _post(_RETURN, True)
     _post(_RETURN, False)
 
+@lru_cache(maxsize=1)
 def _objc():
     ctypes.CDLL("/System/Library/Frameworks/AppKit.framework/AppKit")
     lib = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
@@ -95,12 +102,26 @@ def _objc():
     lib.sel_registerName.argtypes = [ctypes.c_char_p]
     return lib
 
+@lru_cache(maxsize=16)
+def _sender(ret, argtypes):
+    # Independent signatures prevent concurrent status/input calls from changing
+    # objc_msgSend's shared ctypes prototype.
+    return ctypes.CFUNCTYPE(ret, c_void_p, c_void_p, *argtypes)(("objc_msgSend", _objc()))
+
+
 def _msg(ret, obj, sel, *args, argtypes=()):
     lib = _objc()
-    send = lib.objc_msgSend
-    send.restype = ret
-    send.argtypes = [c_void_p, c_void_p, *argtypes]
-    return send(obj, lib.sel_registerName(sel.encode()), *args)
+    return _sender(ret, tuple(argtypes))(obj, lib.sel_registerName(sel.encode()), *args)
+
+
+@contextmanager
+def _autorelease_pool():
+    pool = _msg(c_void_p, _objc().objc_getClass(b"NSAutoreleasePool"), "alloc")
+    pool = _msg(c_void_p, pool, "init")
+    try:
+        yield
+    finally:
+        _msg(None, pool, "drain")
 
 def _nsstring(value) -> str:
     if not value:
@@ -121,7 +142,7 @@ def _roblox_app():
     for index in range(count):
         app = _msg(c_void_p, apps, "objectAtIndex:", index, argtypes=(ctypes.c_ulong,))
         name = _nsstring(_msg(c_void_p, app, "localizedName")).lower()
-        if "roblox" in name:
+        if name in ("roblox", "robloxplayer", "robloxplayerbeta"):
             return app
     return None
 
@@ -134,28 +155,37 @@ def _front_pid() -> int:
     return int(_msg(ctypes.c_int, front, "processIdentifier"))
 
 def roblox_running() -> bool:
-
     try:
-        return _roblox_app() is not None
+        with _autorelease_pool():
+            return _roblox_app() is not None
     except (OSError, AttributeError):
         return False
+
+
+def roblox_focused() -> bool:
+    try:
+        with _autorelease_pool():
+            app = _roblox_app()
+            return bool(app and _front_pid() == int(_msg(ctypes.c_int, app, "processIdentifier")))
+    except (OSError, AttributeError):
+        return False
+
 
 def focus_roblox() -> bool:
-
     try:
-        app = _roblox_app()
+        with _autorelease_pool():
+            app = _roblox_app()
+            if not app:
+                return False
+            pid = int(_msg(ctypes.c_int, app, "processIdentifier"))
+            if _front_pid() == pid:
+                return True
+            _msg(ctypes.c_bool, app, "activateWithOptions:", 2, argtypes=(ctypes.c_ulong,))
+            deadline = time.monotonic() + 0.2
+            while time.monotonic() < deadline:
+                if _front_pid() == pid:
+                    return True
+                time.sleep(0.012)
+            return _front_pid() == pid
     except (OSError, AttributeError):
-        app = None
-    if not app:
         return False
-    pid = int(_msg(ctypes.c_int, app, "processIdentifier"))
-    if _front_pid() == pid:
-        return True
-
-    _msg(ctypes.c_bool, app, "activateWithOptions:", 2, argtypes=(ctypes.c_ulong,))
-    deadline = time.time() + 0.2
-    while time.time() < deadline:
-        if _front_pid() == pid:
-            return True
-        time.sleep(0.012)
-    return _front_pid() == pid

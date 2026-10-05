@@ -29,7 +29,10 @@ static int roblox_window(void) {
         CFDictionaryRef d = CFArrayGetValueAtIndex(info, i);
         CFStringRef owner = CFDictionaryGetValue(d, kCGWindowOwnerName);
         if (!owner) continue;
-        if (CFStringFind(owner, CFSTR("Roblox"), kCFCompareCaseInsensitive).location == kCFNotFound) continue;
+        BOOL player = CFStringCompare(owner, CFSTR("Roblox"), kCFCompareCaseInsensitive) == kCFCompareEqualTo
+                   || CFStringCompare(owner, CFSTR("RobloxPlayer"), kCFCompareCaseInsensitive) == kCFCompareEqualTo
+                   || CFStringCompare(owner, CFSTR("RobloxPlayerBeta"), kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+        if (!player) continue;
         int layer = 0, wid = 0;
         CFNumberGetValue(CFDictionaryGetValue(d, kCGWindowLayer), kCFNumberIntType, &layer);
         CFNumberGetValue(CFDictionaryGetValue(d, kCGWindowNumber), kCFNumberIntType, &wid);
@@ -174,26 +177,21 @@ static void build_templates(void) {
 static char classify(const unsigned char *buf, int w, int h, float *outScore, float *outMargin) {
     float tile[576];
     density_from(buf, w, h, tile);
-    float best = 0, second = 0;
-    int bestI = 0;
+    float letterScores[26] = {0};
     for (int f = 0; f < template_count; f++) {
-        float top = -1, next = -1;
-        int topI = 0;
         for (int i = 0; i < 26; i++) {
             float c = cosine(tile, templates[f][i]);
-            if (c > top) {
-                next = top;
-                top = c;
-                topI = i;
-            } else if (c > next) {
-                next = c;
-            }
+            if (c > letterScores[i]) letterScores[i] = c;
         }
-        if (top > best) {
-            best = top;
-            second = next;
-            bestI = topI;
-        }
+    }
+    float best = 0, second = 0;
+    int bestI = 0;
+    for (int i = 0; i < 26; i++) {
+        if (letterScores[i] > best) {
+            second = best;
+            best = letterScores[i];
+            bestI = i;
+        } else if (letterScores[i] > second) second = letterScores[i];
     }
     if (outScore) *outScore = best;
     if (outMargin) *outMargin = best - second;
@@ -204,22 +202,24 @@ static char classify(const unsigned char *buf, int w, int h, float *outScore, fl
     return (char)('a' + bestI);
 }
 
-static VNRecognizeTextRequest *shared_ocr_request(void) {
-    static VNRecognizeTextRequest *req = nil;
+static VNRecognizeTextRequest *shared_ocr_request(BOOL accurate) {
+    static VNRecognizeTextRequest *fast = nil, *precise = nil;
+    VNRecognizeTextRequest *req = accurate ? precise : fast;
     if (!req) {
         req = [[VNRecognizeTextRequest alloc] init];
-        req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+        req.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
         req.usesLanguageCorrection = NO;
         req.recognitionLanguages = @[@"en-US"];
+        if (accurate) precise = req;
+        else fast = req;
     }
     return req;
 }
 
 static NSString *ocr_text(CGImageRef cg, BOOL accurate) {
-    (void)accurate;
     if (!cg) return @"";
     @autoreleasepool {
-        VNRecognizeTextRequest *req = shared_ocr_request();
+        VNRecognizeTextRequest *req = shared_ocr_request(accurate);
         VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
         NSError *error = nil;
         if (![handler performRequests:@[req] error:&error] || error) return @"";
@@ -234,11 +234,13 @@ static NSString *ocr_text(CGImageRef cg, BOOL accurate) {
             return a.boundingBox.origin.x < b.boundingBox.origin.x ? NSOrderedAscending : NSOrderedDescending;
         }];
         NSMutableString *text = [NSMutableString string];
+        CGFloat lastY = -1;
         for (VNRecognizedTextObservation *o in rows) {
             VNRecognizedText *top = [[o topCandidates:1] firstObject];
             if (!top.string.length || top.confidence < 0.2) continue;
-            if (text.length) [text appendString:@" "];
+            if (text.length) [text appendString:fabs(lastY-o.boundingBox.origin.y) > 0.02 ? @"\n" : @" "];
             [text appendString:top.string];
+            lastY = o.boundingBox.origin.y;
         }
         return [text copy];
     }
@@ -291,7 +293,7 @@ static int contained(Box inner, Box outer) {
 static NSString *clean_field(NSString *text) {
     if (!text.length) return @"";
     return [[text stringByReplacingOccurrencesOfString:@"\t" withString:@" "]
-        stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        stringByReplacingOccurrencesOfString:@"\n" withString:@" | "];
 }
 
 static void emit(NSString *prompt, NSString *header, int tiles, int ms, int full, NSString *error) {
@@ -391,7 +393,7 @@ static char ocr_one_tile(const unsigned char *buf, size_t W, size_t H, Box box) 
         }
     }
     CGImageRef image = image_from_buffer(canvas, (size_t)canvasSide, (size_t)canvasSide);
-    NSString *text = ocr_text(image, NO) ?: @"";
+    NSString *text = ocr_text(image, YES) ?: @"";
     if (image) CGImageRelease(image);
     free(canvas);
     unichar found = 0;
@@ -478,6 +480,33 @@ static char settle_qo(const unsigned char *buf, int w, int h, char guess) {
     return guess;
 }
 
+static char settle_vy(const unsigned char *buf, int w, int h, char guess) {
+    if (guess != 'v' && guess != 'y') return guess;
+    int minx=w, miny=h, maxx=-1, maxy=-1;
+    for (int y=0; y<h; y++) for (int x=0; x<w; x++) {
+        if (!dark_px(buf + ((size_t)y*w+x)*4)) continue;
+        if (x<minx) minx=x;
+        if (x>maxx) maxx=x;
+        if (y<miny) miny=y;
+        if (y>maxy) maxy=y;
+    }
+    int bw=maxx-minx+1, bh=maxy-miny+1;
+    if (bw<8 || bh<8) return guess;
+    int widest=0;
+    for (int y=maxy-bh/3; y<=maxy; y++) {
+        int left=w, right=-1;
+        for (int x=minx; x<=maxx; x++) {
+            if (!dark_px(buf + ((size_t)y*w+x)*4)) continue;
+            if (x<left) left=x;
+            if (x>right) right=x;
+        }
+        if (right-left+1>widest) widest=right-left+1;
+    }
+    if ((double)widest/bw <= 0.34) return 'y';
+    if ((double)widest/bw >= 0.48) return 'v';
+    return guess;
+}
+
 static char read_letter(const unsigned char *buf, size_t W, size_t H, Box box) {
     int w = box.w, h = box.h;
     if (w < 8 || h < 8 || w > 500 || h > 500) return 0;
@@ -494,16 +523,31 @@ static char read_letter(const unsigned char *buf, size_t W, size_t H, Box box) {
     if (shaped == 'o' || shaped == 'q') {
         shaped = settle_qo(tile, w, h, shaped);
         free(tile);
-        if (score >= 0.62f) return shaped;
+        if (score >= 0.88f && margin >= 0.015f) return shaped;
         char seen = ocr_one_tile(buf, W, H, box);
         if (seen && seen != 'o' && seen != 'q') return seen;
-        return shaped;
+        if (seen && score < 0.80f) return seen;
+        return score >= 0.85f ? shaped : 0;
     }
     free(tile);
+    if ((shaped == 'i' || shaped == 'l') && looks_like_i(buf, W, H, box)) return 'i';
 
-    if (shaped && score >= 0.94f && margin >= 0.08f) return shaped;
+    if (shaped && score >= 0.90f && margin >= 0.06f) {
+        if (shaped == 'v' || shaped == 'y') {
+            unsigned char *shape = malloc((size_t)w*h*4);
+            if (shape) {
+                for (int y=0; y<h; y++) memcpy(shape+(size_t)y*w*4, buf+((size_t)(box.y+y)*W+box.x)*4, (size_t)w*4);
+                shaped = settle_vy(shape, w, h, shaped);
+                free(shape);
+            }
+        }
+        return shaped;
+    }
     char seen = ocr_one_tile(buf, W, H, box);
-    if (seen) return seen;
+    if (seen && seen == shaped) return seen;
+    // Disagreement needs a more accurate OCR pass; do not cache a guess.
+    if (seen && (score < 0.80f || margin < 0.02f)) return seen;
+    if (shaped && score >= 0.88f && margin >= 0.04f) return shaped;
     if (looks_like_i(buf, W, H, box)) return 'i';
     return 0;
 }
@@ -542,8 +586,7 @@ static NSString *read_tiles(const unsigned char *buf, size_t W, size_t H, Box *r
             }
         }
 
-        if (!ch) return @"";
-        [letters appendFormat:@"%c", ch];
+        [letters appendFormat:@"%c", ch ? ch : '?'];
     }
     if ((int)letters.length != nrow) return @"";
     return letters;
@@ -562,7 +605,7 @@ static int is_letter_tile(const unsigned char *buf, size_t W, size_t H, Box box)
         }
     }
     double ratio = tot ? (double)ink / (double)tot : 0;
-    if (ratio < 0.012 || ratio > 0.72) return 0;
+    if (ratio > 0.72) return 0;
     int border = 0, samples = 0;
     int step = box.w / 6;
     if (step < 2) step = 2;
@@ -601,17 +644,19 @@ static NSString *ocr_error_band(const unsigned char *buf, size_t W, size_t H, in
     size_t bpr = W * 4;
     unsigned char *bandBuf = malloc((size_t)bandH * bpr);
     if (!bandBuf) return @"";
+    int inkCount = 0;
     for (int y = 0; y < bandH; y++) {
         const unsigned char *src = buf + (size_t)(y0 + y) * bpr;
         unsigned char *dst = bandBuf + (size_t)y * bpr;
         for (size_t x = 0; x < W; x++) {
             const unsigned char *p = src + x * 4;
             unsigned char *d = dst + x * 4;
-            if (message_ink(p)) d[0] = d[1] = d[2] = 0;
+            if (message_ink(p)) { d[0] = d[1] = d[2] = 0; inkCount++; }
             else d[0] = d[1] = d[2] = 255;
             d[3] = 255;
         }
     }
+    if (inkCount < 8) { free(bandBuf); return @""; }
     CGImageRef band = image_from_buffer(bandBuf, W, (size_t)bandH);
     CGImageRef small = band ? fit_width(band, 900) : NULL;
     NSString *text = ocr_text(small ?: band, NO) ?: @"";
@@ -631,18 +676,24 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
     size_t bpr = W * 4;
 
     int headY = (int)(H * 0.012);
-    int headH = (int)(H * 0.145);
+    int headH = (int)(H * 0.20);
     if (headY + headH > (int)H) headH = (int)H - headY;
     if (headH < 8) headH = 8;
     static NSString *cachedHeader = nil;
     static unsigned long cachedHeadHash = 0;
-    unsigned long headHash = hash_bytes(buf + (size_t)headY * bpr, (int)W, headH, 6);
+    // Cache the text mask, not the animated 3D background behind the header.
+    unsigned long headHash = 1469598103934665603UL;
+    for (int y=headY; y<headY+headH; y++) {
+        const unsigned char *row = buf+(size_t)y*bpr;
+        for (size_t x=0; x<W; x++) {
+            const unsigned char *p = row+x*4;
+            headHash ^= (p[0]>210 && p[1]>210 && p[2]>210) ? 1UL : 0UL;
+            headHash *= 1099511628211UL;
+        }
+    }
     NSString *header = cachedHeader ?: @"";
 
-    static CFAbsoluteTime lastHeaderOcr = 0;
-    CFAbsoluteTime headerNow = CFAbsoluteTimeGetCurrent();
-    if ((headHash != cachedHeadHash || !cachedHeader) && headerNow - lastHeaderOcr > 0.45) {
-        lastHeaderOcr = headerNow;
+    if (headHash != cachedHeadHash || !cachedHeader) {
         unsigned char *bandBuf = malloc((size_t)headH * bpr);
         if (bandBuf) {
             memcpy(bandBuf, buf + (size_t)headY * bpr, (size_t)headH * bpr);
@@ -656,8 +707,8 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
                 }
             }
             CGImageRef band = image_from_buffer(bandBuf, W, (size_t)headH);
-            CGImageRef small = band ? fit_width(band, 720) : NULL;
-            header = ocr_text(small ?: band, NO) ?: @"";
+            CGImageRef small = band ? fit_width(band, 1280) : NULL;
+            header = ocr_text(small ?: band, YES) ?: @"";
             if (band) CGImageRelease(band);
             if (small) CGImageRelease(small);
             free(bandBuf);
@@ -736,7 +787,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
             if (bw < minSide || bh < minSide || bw > maxSide || bh > maxSide) continue;
             if (abs(bw - bh) > bw / 5) continue;
             double fill = (double)count / (double)(bw * bh);
-            if (fill < 0.45 || fill > 0.96) continue;
+            if (fill < 0.45) continue;
             boxes[nboxes++] = (Box){minx, miny, bw, bh};
         }
     }
@@ -810,7 +861,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
             }
             double ratio = tot ? (double)ink / (double)tot : 0;
 
-            if (ratio < 0.012 || ratio > 0.72) continue;
+            if (ratio > 0.72) continue;
 
             int border = 0, samples = 0;
             int step = kept[j].w / 6;
@@ -847,19 +898,13 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
             }
         }
     }
-    if (nrow > 0 && tileHash == cachedTileHash && cachedTileHash != 0) {
+    if (nrow > 0 && tileHash == cachedTileHash && cachedTileHash != 0 && cachedFull) {
         prompt = cachedPrompt ?: @"";
         full = cachedFull;
     } else if (nrow > 0) {
         NSString *letters = read_tiles(buf, W, H, row, nrow) ?: @"";
-        if ((int)letters.length == nrow) {
-            prompt = letters;
-            full = 1;
-        } else {
-
-            prompt = @"";
-            full = 0;
-        }
+        prompt = letters;
+        full = (int)letters.length == nrow && [letters rangeOfString:@"?"].location == NSNotFound;
         cachedTileHash = tileHash;
         cachedPrompt = [prompt copy];
         cachedFull = full;
@@ -872,8 +917,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
     }
 
     static NSString *cachedError = nil;
-    static CFAbsoluteTime cachedErrorAt = 0;
-    static CFAbsoluteTime lastErrorOcr = 0;
+    static unsigned long cachedErrorHash = 0;
     NSString *error = @"";
     if (nrow > 0) {
         int bottom = 0;
@@ -881,19 +925,24 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
             int edge = row[i].y + row[i].h;
             if (edge > bottom) bottom = edge;
         }
-        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (now - lastErrorOcr > 0.6) {
-            lastErrorOcr = now;
-            NSString *text = ocr_error_band(buf, W, H, bottom) ?: @"";
-            NSString *low = text.lowercaseString;
-            if ([low containsString:@"already"] || [low containsString:@"used"]) {
-                cachedError = [text copy];
-                cachedErrorAt = now;
-            } else if (cachedError && now - cachedErrorAt > 0.45) {
-                cachedError = nil;
+        int end = bottom + (int)(H * 0.13);
+        if (end > (int)H) end = (int)H;
+        unsigned long errorHash = 1469598103934665603UL;
+        for (int y=bottom; y<end; y++) {
+            const unsigned char *row=buf+(size_t)y*bpr;
+            for (size_t x=0; x<W; x++) {
+                errorHash ^= message_ink(row+x*4) ? 1UL : 0UL;
+                errorHash *= 1099511628211UL;
             }
         }
-        if (cachedError && CFAbsoluteTimeGetCurrent() - cachedErrorAt < 2.0) error = cachedError;
+        if (errorHash != cachedErrorHash || !cachedError) {
+            cachedErrorHash = errorHash;
+            cachedError = [ocr_error_band(buf, W, H, bottom) copy] ?: @"";
+        }
+        error = cachedError ?: @"";
+    } else {
+        cachedError = nil;
+        cachedErrorHash = 0;
     }
     int ms = (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
     emit(prompt, header ?: @"", full ? nrow : nrow, ms, full, error);

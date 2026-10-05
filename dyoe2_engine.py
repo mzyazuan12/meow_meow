@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import heapq
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -335,6 +336,7 @@ class Dyoe2Engine:
         self.reversed_words: list[str] = []
         self.traps = traps or TrapPools()
         self.used_words: set[str] = set()
+        self.rejected_words: set[str] = set()
         self.casual_mode = True
         self.phase = 1
         self.hybrid_suffixes: tuple[str, ...] = ()
@@ -360,7 +362,7 @@ class Dyoe2Engine:
 
     def set_words(
         self,
-        words: Sequence[str],
+        words: Iterable[str],
         traps: TrapPools | None = None,
         *,
         validate_giveable: bool = True,
@@ -396,11 +398,6 @@ class Dyoe2Engine:
         validate_giveable: bool = True,
     ) -> int:
         path = Path(last_txt)
-        words = [
-            line.strip().lower()
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
-            if line.strip()
-        ]
         pools = build_trap_pools(
             casual_path=casual_path,
             traps_path=traps_path,
@@ -408,7 +405,8 @@ class Dyoe2Engine:
             no_plural_path=no_plural_path,
             giveable=None,
         )
-        self.set_words(words, traps=pools, validate_giveable=validate_giveable)
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            self.set_words(stream, traps=pools, validate_giveable=validate_giveable)
         return len(self.wordlist)
 
     def clear_cache(self) -> None:
@@ -444,10 +442,15 @@ class Dyoe2Engine:
 
     def clear_used(self) -> None:
         self.used_words.clear()
+        self.rejected_words.clear()
+        self.clear_cache()
+
+    def mark_rejected(self, word: str) -> None:
+        self.rejected_words.add(word.lower())
         self.clear_cache()
 
     def _is_allowed_word(self, word: str) -> bool:
-        if word in self.used_words:
+        if word in self.used_words or word in self.rejected_words:
             return False
         if self.casual_mode and word_has_punctuation(word):
             return False
@@ -925,19 +928,23 @@ class Dyoe2Engine:
             self.phase,
             self.hybrid_suffixes,
             frozenset(self.used_words),
+            frozenset(self.rejected_words),
             lower in self.cancelled_prompts,
         )
 
     def ranked_words(self, prompt: str, *, limit: int | None = None) -> list[str]:
 
         pool_limit = 256 if limit is None else max(limit, 256)
-        key = self._cache_key(prompt)
+        key = (self._cache_key(prompt), pool_limit if self.phase == 1 and limit is not None else None)
         if self._ranked_cache_key == key and self._ranked_cache:
             ranked = self._ranked_cache
         else:
             if self.phase == 1:
                 candidates = self.prefix_candidates(prompt)
-                ranked = sorted(candidates, key=lambda w: (-len(w), w))
+                order = lambda w: (-len(w), w)
+                ranked = (heapq.nsmallest(pool_limit, candidates, key=order)
+                          if limit is not None and not (self.casual_mode and self.is_prompt_cancelled(prompt))
+                          else sorted(candidates, key=order))
             elif self.phase == 5:
                 custom = list(self.hybrid_suffixes)
                 fallback = self._hybrid_fallback_traps()

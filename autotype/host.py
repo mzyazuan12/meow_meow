@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
+import os
 import struct
 import subprocess
 import sys
@@ -13,17 +15,13 @@ _WATCH = _ROOT / "llwatch"
 _CAP = _ROOT / "llcap.dylib"
 _PROCS: list[subprocess.Popen] = []
 
-_FRAME_MAX = 1280
+_FRAME_MAX = 1600
 
 def _fit_frame(width: int, height: int, max_w: int = _FRAME_MAX):
-    if width <= max_w or width < 4 or height < 4:
-        return 1, width, height
-    factor = max(2, (width + max_w - 1) // max_w)
-    tw = width // factor
-    th = height // factor
-    if tw < 2 or th < 2:
-        return 1, width, height
-    return factor, tw, th
+    if width < 4 or height < 4:
+        return 1.0, width, height
+    factor = max(1.0, width / max_w, height / 1600)
+    return factor, max(2, int(width / factor)), max(2, int(height / factor))
 
 def stop_capture() -> None:
     for proc in _PROCS:
@@ -48,6 +46,23 @@ def focus_roblox() -> bool:
         return _win_focus()
     return _linux_focus()
 
+
+def roblox_focused() -> bool:
+    if sys.platform == "darwin":
+        from autotype.mac_input import roblox_focused as _mac
+        return _mac()
+    if sys.platform == "win32":
+        return _win_is_roblox(_win_api()[0].GetForegroundWindow())
+    x11, display = _linux_display()
+    if not display:
+        return False
+    try:
+        current, revert = ctypes.c_ulong(), ctypes.c_int()
+        x11.XGetInputFocus(display, ctypes.byref(current), ctypes.byref(revert))
+        return current.value == _linux_window(x11, display)
+    finally:
+        x11.XCloseDisplay(display)
+
 def tap_key(kind: str, key: str, hold: float = 0.016) -> None:
     if sys.platform == "darwin":
         from autotype.mac_input import tap_key as _mac
@@ -71,27 +86,21 @@ def press_enter() -> None:
 
 def run_capture(stop: threading.Event, on_frame, on_status, name_fn) -> None:
 
-    if sys.platform == "darwin" and _WATCH.is_file() and _CAP.is_file():
-        _run_mac_native(stop, on_frame, on_status)
-        return
-    _run_portable(stop, on_frame, on_status, name_fn)
+    try:
+        # One reader on every OS. The Mac grabber still uses the native
+        # capture helper; letter and header recognition is shared.
+        _run_portable(stop, on_frame, on_status, name_fn)
+    except (OSError, ImportError, AttributeError) as exc:
+        on_status("unsupported")
+        on_frame({"prompt": "", "header": "", "tiles": 0, "full": False, "error": str(exc)})
 
 def _shrink_rgba(raw: bytes, width: int, height: int, max_w: int = _FRAME_MAX):
-
     factor, tw, th = _fit_frame(width, height, max_w)
     if factor == 1:
         return raw, width, height
-    out = bytearray(tw * th * 4)
-    stride = width * 4
-    step = factor * 4
-    for y in range(th):
-        src = y * factor * stride
-        dst = y * tw * 4
-        for x in range(tw):
-            i = src + x * step
-            out[dst : dst + 4] = raw[i : i + 4]
-            dst += 4
-    return bytes(out), tw, th
+    from PIL import Image
+    image = Image.frombytes("RGBA", (width, height), raw)
+    return image.resize((tw, th), Image.Resampling.LANCZOS).tobytes(), tw, th
 
 def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
     from autotype.mac_input import roblox_running as mac_running
@@ -104,7 +113,6 @@ def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
         bufsize=0,
     )
     _PROCS.append(proc)
-    threading.Thread(target=_read_watch, args=(proc, stop, on_frame), daemon=True).start()
     lib = ctypes.CDLL(str(_CAP))
     lib.ll_grab.restype = ctypes.c_int
     lib.ll_grab.argtypes = [
@@ -125,7 +133,7 @@ def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
                 if status != last:
                     last = status
                     on_status(status)
-                time.sleep(0.25)
+                stop.wait(0.25)
                 continue
             if last != "up":
                 last = "up"
@@ -150,11 +158,19 @@ def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
             except (BrokenPipeError, OSError):
                 return
             del payload
-
-            time.sleep(0.08)
+            assert proc.stdout is not None
+            line = proc.stdout.readline()
+            if not line:
+                break
+            frame = _parse_frame(line.decode("utf-8", "replace"))
+            if frame is not None:
+                on_frame(frame)
+            stop.wait(0.015)
     finally:
         if proc.poll() is None:
             proc.kill()
+        if not stop.is_set():
+            on_status("unsupported")
 
 def _read_watch(proc: subprocess.Popen, stop: threading.Event, on_frame) -> None:
     if proc.stdout is None:
@@ -200,13 +216,17 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn) -> None:
 
     last = ""
     while not stop.is_set():
+        if sys.platform not in ("darwin", "win32") and not os.environ.get("DISPLAY"):
+            on_status("unsupported" if roblox_running() else "down")
+            stop.wait(0.5)
+            continue
         grabbed = _grab()
         if grabbed is None:
             status = "hidden" if roblox_running() else "down"
             if status != last:
                 last = status
                 on_status(status)
-            time.sleep(0.25)
+            stop.wait(0.25)
             continue
         if last != "up":
             last = "up"
@@ -217,7 +237,7 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn) -> None:
         frame = scan_rgba(raw, width, height, name_fn() if name_fn else "")
         frame["ms"] = int((time.perf_counter() - started) * 1000)
         on_frame(frame)
-        time.sleep(0.08)
+        stop.wait(0.015)
 
 def _grab():
     if sys.platform == "win32":
@@ -232,54 +252,106 @@ def _key_event(ch: str, hold: float) -> None:
     else:
         _linux_key(ch, hold)
 
-def _win_process() -> bool:
+_WIN_APIS = None
+
+
+def _win_api():
+    """Declare pointer-sized handles explicitly (the ctypes default is 32-bit)."""
+    global _WIN_APIS
+    if _WIN_APIS is not None:
+        return _WIN_APIS
+    wt = ctypes.wintypes
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "EnumWindows": ([ctypes.c_void_p, ctypes.c_void_p], wt.BOOL),
+        "IsWindowVisible": ([wt.HWND], wt.BOOL),
+        "IsIconic": ([wt.HWND], wt.BOOL),
+        "GetWindowRect": ([wt.HWND, ctypes.POINTER(wt.RECT)], wt.BOOL),
+        "GetClientRect": ([wt.HWND, ctypes.POINTER(wt.RECT)], wt.BOOL),
+        "ClientToScreen": ([wt.HWND, ctypes.POINTER(wt.POINT)], wt.BOOL),
+        "GetWindowThreadProcessId": ([wt.HWND, ctypes.POINTER(wt.DWORD)], wt.DWORD),
+        "GetForegroundWindow": ([], wt.HWND),
+        "AttachThreadInput": ([wt.DWORD, wt.DWORD, wt.BOOL], wt.BOOL),
+        "ShowWindow": ([wt.HWND, ctypes.c_int], wt.BOOL),
+        "SetForegroundWindow": ([wt.HWND], wt.BOOL),
+        "GetDC": ([wt.HWND], wt.HDC),
+        "ReleaseDC": ([wt.HWND, wt.HDC], ctypes.c_int),
+        "VkKeyScanW": ([wt.WCHAR], ctypes.c_short),
+        "MapVirtualKeyW": ([wt.UINT, wt.UINT], wt.UINT),
+        "SendInput": ([wt.UINT, ctypes.c_void_p, ctypes.c_int], wt.UINT),
+    }
+    for name, (args, ret) in signatures.items():
+        fn = getattr(user, name)
+        fn.argtypes, fn.restype = args, ret
+    for name, args, ret in (
+        ("CreateCompatibleDC", [wt.HDC], wt.HDC),
+        ("CreateCompatibleBitmap", [wt.HDC, ctypes.c_int, ctypes.c_int], wt.HBITMAP),
+        ("SelectObject", [wt.HDC, wt.HANDLE], wt.HANDLE),
+        ("DeleteObject", [wt.HANDLE], wt.BOOL),
+        ("DeleteDC", [wt.HDC], wt.BOOL),
+        ("SetStretchBltMode", [wt.HDC, ctypes.c_int], ctypes.c_int),
+        ("StretchBlt", [wt.HDC] + [ctypes.c_int]*4 + [wt.HDC] + [ctypes.c_int]*4 + [wt.DWORD], wt.BOOL),
+        ("GetDIBits", [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p, ctypes.c_void_p, wt.UINT], ctypes.c_int),
+    ):
+        fn = getattr(gdi, name)
+        fn.argtypes, fn.restype = args, ret
+    kernel.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    kernel.OpenProcess.restype = wt.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wt.BOOL
+    kernel.CloseHandle.argtypes = [wt.HANDLE]
+    kernel.CloseHandle.restype = wt.BOOL
     try:
-        user32 = ctypes.windll.user32
-    except (AttributeError, OSError):
+        user.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except AttributeError:
+        user.SetProcessDPIAware()
+    _WIN_APIS = user, gdi, kernel
+    return _WIN_APIS
+
+
+def _win_is_roblox(hwnd) -> bool:
+    user, _, kernel = _win_api()
+    pid = ctypes.wintypes.DWORD()
+    user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    handle = kernel.OpenProcess(0x1000, False, pid.value)
+    if not handle:
         return False
-    found = []
-
-    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    def visit(hwnd, _lp):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        if "roblox" in buf.value.lower():
-            found.append(hwnd)
+    try:
+        path = ctypes.create_unicode_buffer(32768)
+        length = ctypes.wintypes.DWORD(len(path))
+        if not kernel.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
             return False
-        return True
+        name = path.value.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return name in ("robloxplayerbeta.exe", "robloxplayer.exe") or (
+            name == "windows10universal.exe" and "roblox" in path.value.lower())
+    finally:
+        kernel.CloseHandle(handle)
 
-    user32.EnumWindows(visit, 0)
-    return bool(found)
 
-def _win_hwnd():
-    user32 = ctypes.windll.user32
+def _win_process() -> bool:
+    # Include minimized windows when reporting whether the player is running.
+    return bool(_win_hwnd(visible=False))
+
+
+def _win_hwnd(*, visible: bool = True):
+    user, _, _ = _win_api()
     found = []
-
-    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    @ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.c_void_p)
     def visit(hwnd, _lp):
-        if not user32.IsWindowVisible(hwnd):
+        if visible and (not user.IsWindowVisible(hwnd) or user.IsIconic(hwnd)):
             return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value.lower()
-        if "roblox" in title:
-            rect = ctypes.wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+        if not _win_is_roblox(hwnd):
+            return True
+        rect = ctypes.wintypes.RECT()
+        if user.GetClientRect(hwnd, ctypes.byref(rect)):
+            area = max(0, rect.right-rect.left)*max(0, rect.bottom-rect.top)
             found.append((area, hwnd))
         return True
-
-    user32.EnumWindows(visit, 0)
-    if not found:
-        return None
-    found.sort()
-    return found[-1][1]
+    user.EnumWindows(visit, 0)
+    return max(found, default=(0, None))[1]
 
 def _win_focus() -> bool:
     try:
@@ -288,14 +360,15 @@ def _win_focus() -> bool:
         return False
     if not hwnd:
         return False
-    user32 = ctypes.windll.user32
+    user32 = _win_api()[0]
     current = user32.GetForegroundWindow()
     if current == hwnd:
         return True
     fore_thread = user32.GetWindowThreadProcessId(current, None)
     target_thread = user32.GetWindowThreadProcessId(hwnd, None)
     user32.AttachThreadInput(fore_thread, target_thread, True)
-    user32.ShowWindow(hwnd, 9)
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)
     user32.SetForegroundWindow(hwnd)
     user32.AttachThreadInput(fore_thread, target_thread, False)
     deadline = time.time() + 0.2
@@ -306,7 +379,7 @@ def _win_focus() -> bool:
     return user32.GetForegroundWindow() == hwnd
 
 def _win_key(ch: str, hold: float) -> None:
-    user32 = ctypes.windll.user32
+    user32 = _win_api()[0]
     vk, shift = _win_vk(ch)
     if vk is None:
         return
@@ -320,12 +393,12 @@ def _win_key(ch: str, hold: float) -> None:
         _win_send(0x10, True)
 
 def _win_vk(ch: str):
-    user32 = ctypes.windll.user32
+    user32 = _win_api()[0]
     if ch == "\n":
         return 0x0D, False
     if ch == "\b":
         return 0x08, False
-    scanned = user32.VkKeyScanW(ord(ch))
+    scanned = user32.VkKeyScanW(ch)
     if scanned == -1:
         return None, False
     return scanned & 0xFF, bool(scanned & 0x100)
@@ -373,7 +446,7 @@ def _win_input_type():
     return INPUT
 
 def _win_send(vk: int, up: bool) -> None:
-    user32 = ctypes.windll.user32
+    user32 = _win_api()[0]
     scan = user32.MapVirtualKeyW(vk, 0)
     flags = 0x0008 | (0x0002 if up else 0)
     input_type = _win_input_type()
@@ -382,7 +455,8 @@ def _win_send(vk: int, up: bool) -> None:
     event.union.ki.wVk = vk
     event.union.ki.wScan = scan
     event.union.ki.dwFlags = flags
-    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event))
+    if user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) != 1:
+        raise OSError(ctypes.get_last_error(), "Windows couldn't send a key to Roblox")
 
 def _grab_win():
     try:
@@ -391,10 +465,13 @@ def _grab_win():
         return None
     if not hwnd:
         return None
-    user32 = ctypes.windll.user32
-    gdi32 = ctypes.windll.gdi32
+    user32 = _win_api()[0]
+    gdi32 = _win_api()[1]
     rect = ctypes.wintypes.RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    origin = ctypes.wintypes.POINT(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
         return None
     width = rect.right - rect.left
     height = rect.bottom - rect.top
@@ -409,7 +486,7 @@ def _grab_win():
     gdi32.SetStretchBltMode(memory, 3)
     ok = gdi32.StretchBlt(
         memory, 0, 0, dst_w, dst_h,
-        desktop, rect.left, rect.top, width, height,
+        desktop, origin.x, origin.y, width, height,
         0x00CC0020,
     )
     class BITMAPINFOHEADER(ctypes.Structure):
@@ -435,15 +512,16 @@ def _grab_win():
     info.biBitCount = 32
     info.biCompression = 0
     buf = ctypes.create_string_buffer(dst_w * dst_h * 4)
-    gdi32.GetDIBits(memory, bitmap, 0, dst_h, buf, ctypes.byref(info), 0)
+    # GetDIBits requires the bitmap to be deselected first.
     gdi32.SelectObject(memory, old)
+    rows = gdi32.GetDIBits(memory, bitmap, 0, dst_h, buf, ctypes.byref(info), 0)
     gdi32.DeleteObject(bitmap)
     gdi32.DeleteDC(memory)
     user32.ReleaseDC(0, desktop)
-    if not ok:
+    if not ok or rows != dst_h:
         return None
-
-    return buf.raw, dst_w, dst_h
+    from PIL import Image
+    return Image.frombytes("RGBA", (dst_w, dst_h), buf.raw, "raw", "BGRA").tobytes(), dst_w, dst_h
 
 def _grab_mac():
     if not _CAP.is_file():
@@ -468,30 +546,62 @@ def _grab_mac():
     finally:
         libc.free(ptr)
 
+def _linux_player_pid(pid: int) -> bool:
+    try:
+        name = (Path("/proc") / str(pid) / "comm").read_text(encoding="utf-8", errors="replace").strip().lower()
+    except OSError:
+        return False
+    return name == "roblox" or name.startswith("robloxplayer") or name == "sober"
+
+
 def _linux_process() -> bool:
     proc = Path("/proc")
     if not proc.is_dir():
         return False
     try:
-        for entry in proc.iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                comm = (entry / "comm").read_text(encoding="utf-8", errors="replace").lower()
-            except OSError:
-                continue
-            if "roblox" in comm:
-                return True
+        return any(_linux_player_pid(int(entry.name)) for entry in proc.iterdir() if entry.name.isdigit())
     except OSError:
         return False
-    return False
+
+
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+def _x_error(display, event):
+    # Windows can disappear between enumeration and capture. Do not let Xlib's
+    # default error handler terminate the entire app for that race.
+    return 0
+
 
 def _linux_display():
     try:
         x11 = ctypes.CDLL("libX11.so.6")
     except OSError:
         return None, None
-    x11.XOpenDisplay.restype = ctypes.c_void_p
+    ptr, window = ctypes.c_void_p, ctypes.c_ulong
+    signatures = {
+        "XOpenDisplay": ([ctypes.c_char_p], ptr),
+        "XCloseDisplay": ([ptr], ctypes.c_int),
+        "XDefaultRootWindow": ([ptr], window),
+        "XFree": ([ptr], ctypes.c_int),
+        "XFetchName": ([ptr, window, ctypes.POINTER(ctypes.c_char_p)], ctypes.c_int),
+        "XSetInputFocus": ([ptr, window, ctypes.c_int, ctypes.c_ulong], ctypes.c_int),
+        "XRaiseWindow": ([ptr, window], ctypes.c_int),
+        "XFlush": ([ptr], ctypes.c_int),
+        "XKeysymToKeycode": ([ptr, ctypes.c_ulong], ctypes.c_uint),
+        "XGetInputFocus": ([ptr, ctypes.POINTER(window), ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
+        "XGetWindowAttributes": ([ptr, window, ptr], ctypes.c_int),
+        "XGetImage": ([ptr, window, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int], ptr),
+        "XDestroyImage": ([ptr], ctypes.c_int),
+        "XInternAtom": ([ptr, ctypes.c_char_p, ctypes.c_int], ctypes.c_ulong),
+        "XGetWindowProperty": ([ptr, window, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int,
+                                ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+                                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                                ctypes.POINTER(ptr)], ctypes.c_int),
+        "XSetErrorHandler": ([ctypes.c_void_p], ctypes.c_void_p),
+    }
+    for name, (args, ret) in signatures.items():
+        fn = getattr(x11, name)
+        fn.argtypes, fn.restype = args, ret
+    x11.XSetErrorHandler(_x_error)
     display = x11.XOpenDisplay(None)
     return x11, display
 
@@ -503,10 +613,27 @@ def _linux_focus() -> bool:
     if not window:
         x11.XCloseDisplay(display)
         return False
+    x11.XRaiseWindow(display, window)
     x11.XSetInputFocus(display, window, 1, 0)
     x11.XFlush(display)
     x11.XCloseDisplay(display)
     return True
+
+def _linux_pid(x11, display, window) -> int:
+    atom = x11.XInternAtom(display, b"_NET_WM_PID", False)
+    kind, count, remaining = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_ulong()
+    fmt, data = ctypes.c_int(), ctypes.c_void_p()
+    result = x11.XGetWindowProperty(display, window, atom, 0, 1, False, 6,
+                                   ctypes.byref(kind), ctypes.byref(fmt), ctypes.byref(count),
+                                   ctypes.byref(remaining), ctypes.byref(data))
+    try:
+        if result == 0 and data and count.value and fmt.value == 32:
+            return int(ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong)).contents.value)
+        return 0
+    finally:
+        if data:
+            x11.XFree(data)
+
 
 def _linux_window(x11, display):
     root = x11.XDefaultRootWindow(display)
@@ -517,7 +644,7 @@ def _linux_window(x11, display):
         x11.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
         x11.XFetchName.restype = ctypes.c_int
         if x11.XFetchName(display, window, ctypes.byref(name)) and name.value:
-            if b"roblox" in name.value.lower():
+            if (b"roblox" in name.value.lower() or b"sober" in name.value.lower()) and _linux_player_pid(_linux_pid(x11, display, window)):
                 found.append(window)
             x11.XFree(name)
         kids = ctypes.POINTER(ctypes.c_ulong)()
@@ -546,13 +673,13 @@ def _linux_window(x11, display):
 def _linux_key(ch: str, hold: float) -> None:
     try:
         xtst = ctypes.CDLL("libXtst.so.6")
-        x11 = ctypes.CDLL("libX11.so.6")
-    except OSError:
-        return
-    x11.XOpenDisplay.restype = ctypes.c_void_p
-    display = x11.XOpenDisplay(None)
+        xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+        x11, display = _linux_display()
+    except OSError as exc:
+        raise OSError("X11 keyboard control is unavailable") from exc
     if not display:
-        return
+        raise OSError("An X11 display is required for keyboard control")
     if ch == "\n":
         keysym = 0xFF0D
     elif ch == "\b":
@@ -561,14 +688,18 @@ def _linux_key(ch: str, hold: float) -> None:
         keysym = ord(ch.lower())
     x11.XStringToKeysym.restype = ctypes.c_ulong
     code = x11.XKeysymToKeycode(display, keysym)
-    if code:
-        xtst.XTestFakeKeyEvent(display, code, True, 0)
+    try:
+        if not code or not xtst.XTestFakeKeyEvent(display, code, True, 0):
+            raise OSError("X11 couldn't send a key to Roblox")
         x11.XFlush(display)
-        if hold:
-            time.sleep(hold)
-        xtst.XTestFakeKeyEvent(display, code, False, 0)
-        x11.XFlush(display)
-    x11.XCloseDisplay(display)
+        try:
+            if hold:
+                time.sleep(hold)
+        finally:
+            xtst.XTestFakeKeyEvent(display, code, False, 0)
+            x11.XFlush(display)
+    finally:
+        x11.XCloseDisplay(display)
 
 def _grab_linux():
     try:
@@ -613,7 +744,9 @@ def _grab_linux_image():
         ]
 
     attrs = XWindowAttributes()
-    x11.XGetWindowAttributes(display, window, ctypes.byref(attrs))
+    if not x11.XGetWindowAttributes(display, window, ctypes.byref(attrs)) or attrs.map_state != 2:
+        x11.XCloseDisplay(display)
+        return None
     width, height = attrs.width, attrs.height
     if width < 200 or height < 200:
         x11.XCloseDisplay(display)
@@ -642,15 +775,19 @@ def _grab_linux_image():
 
     info = ctypes.cast(image, ctypes.POINTER(XImage)).contents
     row = info.bytes_per_line
-    bpp = max(info.bits_per_pixel // 8, 4)
+    bpp = info.bits_per_pixel // 8
+    if bpp not in (3, 4):
+        x11.XDestroyImage(image)
+        x11.XCloseDisplay(display)
+        return None
     factor, tw, th = _fit_frame(width, height)
     out = bytearray(tw * th * 4)
     for y in range(th):
-        src = y * factor * row
+        src = int(y * factor) * row
         for x in range(tw):
-            pixel = src + x * factor * bpp
+            pixel = src + int(x * factor) * bpp
             base = ctypes.addressof(info.data.contents) + pixel
-            bgra = ctypes.string_at(base, 4)
+            bgra = ctypes.string_at(base, bpp)
             i = (y * tw + x) * 4
             out[i] = bgra[2]
             out[i + 1] = bgra[1]

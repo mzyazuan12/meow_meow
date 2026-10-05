@@ -43,7 +43,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 }
 
 @interface Panel : NSObject <NSApplicationDelegate, NSTextFieldDelegate, NSWindowDelegate>
-@property (nonatomic, strong) NSWindow *window;
+@property (nonatomic, strong) NSPanel *window;
 @property (nonatomic, strong) NSTextField *usedLabel;
 @property (nonatomic, strong) NSTextField *statusLabel;
 @property (nonatomic, strong) NSTextField *nameField;
@@ -64,6 +64,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 @property (nonatomic, strong) NSTextField *typeLabel;
 @property (nonatomic, strong) NSTextField *trapLabel;
 @property (nonatomic, strong) NSButton *armButton;
+@property (nonatomic, strong) NSButton *confirmButton;
 @property (nonatomic, strong) NSTextView *logView;
 @property (nonatomic) BOOL casual;
 @property (nonatomic) BOOL armed;
@@ -90,8 +91,8 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     CGFloat width = 420;
     CGFloat height = 700;
     NSRect frame = NSMakeRect(NSMaxX(screen) - width - 28, NSMinY(screen) + 36, width, height);
-    self.window = [[NSWindow alloc] initWithContentRect:frame
-                                               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
+    self.window = [[NSPanel alloc] initWithContentRect:frame
+                                               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskNonactivatingPanel
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
     self.window.title = @"Last Letter";
@@ -99,6 +100,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     self.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     self.window.backgroundColor = inkColor();
     self.window.level = NSFloatingWindowLevel;
+    self.window.hidesOnDeactivate = NO;
     [self.window setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary];
     NSView *root = self.window.contentView;
     root.wantsLayer = YES;
@@ -167,8 +169,10 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     [root addSubview:self.phaseLabel];
 
     self.turnLabel = label(@"WAITING", 12, boneColor(), YES);
-    self.turnLabel.frame = NSMakeRect(18, 474, 384, 18);
+    self.turnLabel.frame = NSMakeRect(18, 474, 228, 18);
     [root addSubview:self.turnLabel];
+    self.confirmButton = [self button:@"It's your turn?" action:@selector(confirm:) frame:NSMakeRect(250, 470, 152, 26) bg:cardColor() fg:boneColor()];
+    [root addSubview:self.confirmButton];
 
     NSView *card = [[NSView alloc] initWithFrame:NSMakeRect(18, 168, 384, 296)];
     self.cardView = card;
@@ -223,8 +227,10 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     scroll.documentView = self.logView;
     [root addSubview:scroll];
 
-    [self.window makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
+    // Stay visible without becoming the active app. Stealing key focus from
+    // Roblox drops the synthetic keys until the player clicks the game.
+    self.window.becomesKeyOnlyIfNeeded = YES;
+    [self.window orderFrontRegardless];
     [self startReader];
 }
 
@@ -301,7 +307,8 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
         self.armButton.frame = NSMakeRect(18, 76, 186, 36);
         self.resetButton.frame = NSMakeRect(216, 76, 186, 36);
         self.cardView.frame = NSMakeRect(18, 122, 384, 296);
-        self.turnLabel.frame = NSMakeRect(18, 428, 384, 18);
+        self.turnLabel.frame = NSMakeRect(18, 428, 228, 18);
+        self.confirmButton.frame = NSMakeRect(250, 424, 152, 26);
         self.phaseLabel.frame = NSMakeRect(18, 450, 384, 18);
         self.spamField.frame = NSMakeRect(18, 476, 384, 28);
         self.spamCaption.frame = NSMakeRect(18, 508, 384, 16);
@@ -313,7 +320,8 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
         self.armButton.frame = NSMakeRect(18, 118, 186, 36);
         self.resetButton.frame = NSMakeRect(216, 118, 186, 36);
         self.cardView.frame = NSMakeRect(18, 168, 384, 296);
-        self.turnLabel.frame = NSMakeRect(18, 474, 384, 18);
+        self.turnLabel.frame = NSMakeRect(18, 474, 228, 18);
+        self.confirmButton.frame = NSMakeRect(250, 470, 152, 26);
         self.phaseLabel.frame = NSMakeRect(18, 496, 384, 18);
     }
 }
@@ -328,10 +336,13 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 - (void)pro:(id)sender { [self send:@"PRO"]; }
 - (void)spam:(id)sender { [self send:@"SPAM"]; }
 - (void)newGame:(id)sender { [self send:@"NEW"]; }
+- (void)confirm:(id)sender { [self send:@"CONFIRM"]; }
 
 - (void)controlTextDidChange:(NSNotification *)note {
     if (note.object == self.spamField) {
         [self send:[NSString stringWithFormat:@"SPAMTEXT\t%@", self.spamField.stringValue ?: @""]];
+    } else if (note.object == self.nameField) {
+        [self send:[NSString stringWithFormat:@"NAME\t%@", self.nameField.stringValue ?: @""]];
     }
 }
 

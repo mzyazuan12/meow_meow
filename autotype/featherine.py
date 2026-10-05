@@ -84,12 +84,6 @@ def key_delay(rhythm: str, tempo: float, rng: Callable[[], float]) -> float:
         delay += 0.25 + rng() * 0.5
     elif roll < 0.16:
         delay += 0.12 + rng() * 0.25
-    if rhythm not in ("instant", "mechanical"):
-        swing = rng()
-        if swing < 0.22:
-            delay *= 0.28 + rng() * 0.3
-        elif swing < 0.40:
-            delay += 0.05 + rng() * 0.18
     return delay
 
 def typo_budget(word_length: int, rhythm: str, rng: Callable[[], float]) -> int:

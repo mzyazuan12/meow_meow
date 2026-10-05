@@ -6,7 +6,6 @@ import unittest
 from dyoe2_engine import Dyoe2Engine, TrapPools
 
 from autotype.featherine import build_plan, featherine_plan, human_plan, live_plan
-from autotype.tiles import settle_qo
 from autotype.session import (
     BoardWatch,
     MatchSession,
@@ -60,8 +59,9 @@ class BoardWatchTests(unittest.TestCase):
         self.assertEqual(watch.observe("w", "ours", now=0.0)["play"], "")
         self.assertEqual(watch.observe("wo", "ours", now=0.25)["play"], "")
         self.assertEqual(watch.observe("wow", "ours", now=0.45)["play"], "")
-        self.assertEqual(watch.observe("wow", "ours", now=0.9)["play"], "")
-        self.assertEqual(watch.observe("wow", "ours", now=1.2)["play"], "wow")
+        self.assertEqual(watch.observe("wow", "ours", now=0.47)["play"], "wow")
+        watch.played = "wow"
+        self.assertEqual(watch.observe("wow", "ours", now=0.49)["play"], "")
 
     def test_an_unread_tile_keeps_the_prefix_from_settling(self) -> None:
         watch = BoardWatch()
@@ -259,38 +259,19 @@ class HumanTypingTests(unittest.TestCase):
         self.assertGreater(corrections, 0)
         self.assertLess(corrections, len(plans))
 
-def _glyph(width: int, height: int, oval: bool, tail: bool) -> bytes:
-    raw = bytearray([255]) * (width * height * 3)
-    cx, cy = width / 2, height * 0.42
-    rx, ry = width * 0.22, height * 0.22
-
-    def paint(x: int, y: int) -> None:
-        if 0 <= x < width and 0 <= y < height:
-            i = (y * width + x) * 3
-            raw[i : i + 3] = b"\x00\x00\x00"
-
-    if oval:
-        for y in range(height):
-            for x in range(width):
-                dx = (x - cx) / rx
-                dy = (y - cy) / ry
-                dist = (dx * dx + dy * dy) ** 0.5
-                if 0.72 <= dist <= 1.02:
-                    paint(x, y)
-    if tail:
-        for step in range(int(height * 0.34)):
-            x = int(cx + rx * 0.55) + step // 3
-            y = int(cy + ry) + step
-            for dx in range(-1, 2):
-                paint(x + dx, y)
-    return bytes(raw)
-
 class LetterShapeTests(unittest.TestCase):
-    def test_q_tail_is_not_read_as_o(self) -> None:
-        bowl = _glyph(96, 120, oval=True, tail=False)
-        tailed = _glyph(96, 120, oval=True, tail=True)
-        self.assertEqual(settle_qo(bowl, 96, 120, 3, "q"), "o")
-        self.assertEqual(settle_qo(tailed, 96, 120, 3, "o"), "q")
+    def test_q_is_not_read_as_o_or_y_as_v(self) -> None:
+        from PIL import Image
+
+        from autotype.glyphs import _atlas_tiles, read_tile
+
+        for letter, crop in _atlas_tiles():
+            if letter not in "qovy":
+                continue
+            self.assertEqual(read_tile(crop), letter)
+            from numpy import asarray
+            image = Image.fromarray(crop).resize((28, 28), Image.BILINEAR)
+            self.assertEqual(read_tile(asarray(image)), letter, letter)
 
 if __name__ == "__main__":
     unittest.main()

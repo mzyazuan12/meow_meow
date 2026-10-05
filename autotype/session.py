@@ -7,11 +7,9 @@ from typing import Optional, Tuple
 from dyoe2_engine import Dyoe2Engine
 
 ROUNDS_PER_PHASE = 5
-_NAME_RE = re.compile(r"([a-z0-9_]{2,24})", re.I)
-_TURN_RE = re.compile(
-    r"([a-z0-9_]{2,24})\s*,?\s*type an english word",
-    re.I,
-)
+# OCR can split a username and confuse I/l/1 in the instruction itself.
+_INSTRUCTION_RE = re.compile(r"t[yv]pe\s*an\s*eng[l1i]ish\s*w[o0q]rd", re.I)
+_TURN_RE = re.compile(r"(?:t[yv]pe\s*an\s*eng[l1i]ish\s*w[o0q]rd|starting\s*with)", re.I)
 
 def phase_for_round(round_n: int) -> int:
     n = max(1, int(round_n or 1))
@@ -32,495 +30,286 @@ def sync_round_to_prefix(round_n: int, prefix: str) -> int:
         guard += 1
     return round_n
 
-def _shared_run(a: str, b: str) -> int:
-    best = 0
-    for size in range(min(len(a), len(b)), 3, -1):
-        for i in range(len(a) - size + 1):
-            if a[i : i + size] in b:
-                return size
-        best = max(best, size)
-    return 0
+def _name_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "", (value or "").lower())
+
+
+def _ocr_distance(a: str, b: str) -> float:
+    groups = ("o0q", "il1", "yv", "g9", "s5", "b8")
+    row = list(range(len(b) + 1))
+    for i, left in enumerate(a, 1):
+        nxt = [float(i)]
+        for j, right in enumerate(b, 1):
+            cost = 0.0 if left == right else 0.25 if any(left in g and right in g for g in groups) else 1.0
+            nxt.append(min(row[j] + 1, nxt[-1] + 1, row[j - 1] + cost))
+        row = nxt
+    return row[-1]
+
 
 def names_match(ours: str, seen: str) -> bool:
-    a = re.sub(r"[^a-z0-9]", "", (ours or "").lower())
-    b = re.sub(r"[^a-z0-9]", "", (seen or "").lower())
-    if len(a) < 3 or len(b) < 3:
+    a, b = _name_key(ours), _name_key(seen)
+    if not a or not b:
         return False
-    if a == b or a in b or b in a:
+    if a == b:
         return True
+    if min(len(a), len(b)) < 4:
+        return False
+    letters_a = re.sub(r"[0-9_]", "", a)
+    letters_b = re.sub(r"[0-9_]", "", b)
+    if letters_a == letters_b and re.sub(r"[^0-9]", "", a) != re.sub(r"[^0-9]", "", b):
+        # player1 and player2 are separate people, even though most letters match.
+        return False
+    # Never match just a shared number or a tiny substring of someone else's name.
+    if min(len(a), len(b)) < max(len(a), len(b)) * 0.65:
+        return False
+    return _ocr_distance(a, b) <= max(0.5, max(len(a), len(b)) * 0.26)
 
-    if len(a) >= 6 and a[-6:] == b[-6:]:
-        return True
-    digits_a = re.sub(r"\D", "", a)
-    digits_b = re.sub(r"\D", "", b)
-    if len(digits_a) >= 4 and digits_a == digits_b:
-        return True
-    letters_a = re.sub(r"[^a-z]", "", a)
-    letters_b = re.sub(r"[^a-z]", "", b)
-
-    return _shared_run(digits_a, digits_b) >= 5 and _shared_run(letters_a, letters_b) >= 5
 
 def speaker_from_header(header: str) -> str:
     text = header or ""
-    match = _TURN_RE.search(text)
-    if match and len(match.group(1)) >= 4:
-        return match.group(1)
-    if "starting with" not in text.lower() and "english word" not in text.lower():
+    match = _INSTRUCTION_RE.search(text)
+    if not match:
         return ""
+    # The name is the last token on the instruction's line. Menu icons sit in
+    # front of it, separated by real gaps, so they must not be glued on.
+    head = re.split(r"\n|\|", text[: match.start()])[-1]
+    tokens = re.findall(r"[A-Za-z0-9_]{2,32}", head)
+    if not tokens:
+        return ""
+    return _name_key(tokens[-1])
 
-    head = re.split(r"type an english", text, flags=re.I)[0]
-    tokens = [token for token in _NAME_RE.findall(head) if len(token) >= 4]
-    return tokens[-1] if tokens else ""
 
 def header_is_ours(name: str, header: str) -> bool:
+    return header_is_turn(header) and names_match(name, speaker_from_header(header))
 
-    if not header_is_turn(header):
-        return False
-    speaker = speaker_from_header(header)
-    if names_match(name, speaker):
-        return True
-    compact = re.sub(r"[^a-z0-9]", "", (header or "").lower())
-    letters = re.sub(r"[^a-z]", "", (name or "").lower())
-    digits = re.sub(r"\D", "", name or "")
-    if len(letters) >= 4 and letters in compact:
-        return True
-    return len(digits) >= 4 and digits in compact
 
 def already_used_text(text: str) -> bool:
-
     low = re.sub(r"[^a-z]+", " ", (text or "").lower())
     return "already" in low and "used" in low
 
+
+def rejected_text(text: str) -> bool:
+    low = (text or "").lower()
+    return already_used_text(low) or any(term in low for term in ("not a word", "invalid word", "not an english word"))
+
+
 def header_is_turn(header: str) -> bool:
-    low = (header or "").lower()
-    return "english word" in low or "starting with" in low
+    return bool(_TURN_RE.search(header or ""))
 
-_PREFIX_SETTLE = 0.72
-_PREFIX_SETTLE_FULL = 0.24
-_OURS_HEADER = 0.22
-
-_SAME_PROMPT = 0.95
 
 class BoardWatch:
+    """Track acceptance at turn boundaries, separately from letters being typed.
+
+    Two complete, identical board reads confirm a prompt. There is no timer-based
+    lead-in; incomplete tiles reset confirmation and never lose their positions.
+    """
 
     def __init__(self) -> None:
-        self.turn = ""
-        self.pending = ""
-        self.played = ""
-        self.typed = ""
-        self._memory: list[str] = []
-        self._reject_hits = 0
-        self._alt = ""
-        self._clock = 0.0
-        self._hold = ""
-        self._hold_at = 0.0
-        self._ours_since: Optional[float] = None
-        self._opponent_prompt = ""
-        self._saw_theirs = False
-        self._saw_long = False
-        self._released = False
-        self._need_their_turn = False
-        self._last_reads: list[str] = []
-        self._retry_prompt = ""
+        self.reset()
 
     def reset(self) -> None:
         self.turn = ""
         self.pending = ""
         self.played = ""
         self.typed = ""
-        self._memory = []
+        self._memory: list[str] = []
+        self._last_reads: list[str] = []
+        self._given = ""
+        self._opponent_active = False
+        self._await_opponent = False
+        self._candidate = ""
+        self._candidate_hits = 0
+        self._recovery_pending = False
+        self._recovery_given = ""
         self._reject_hits = 0
-        self._alt = ""
-        self._clock = 0.0
-        self._hold = ""
-        self._hold_at = 0.0
-        self._ours_since = None
-        self._opponent_prompt = ""
-        self._saw_theirs = False
-        self._saw_long = False
-        self._released = False
-        self._need_their_turn = False
-        self._last_reads = []
         self._retry_prompt = ""
+        self._clock = 0.0
+        self._hold_board = ""
+        self._hold_since = 0.0
 
     def forget_partials(self) -> None:
         self._last_reads = []
+        self._recovery_pending = False
 
     def rearm(self, prompt: str, now: float) -> None:
-
-        prompt = self._prompt(prompt)
         self.played = ""
         self.typed = ""
+        self.pending = self._prompt(prompt)
         self.turn = "ours"
-        self.pending = prompt
-        self._need_their_turn = False
-        self._released = True
-        self._opponent_prompt = ""
-        self._saw_theirs = True
-        self._saw_long = False
-        self._hold = prompt
-        self._hold_at = now - _PREFIX_SETTLE - 0.05
-        self._ours_since = now - _OURS_HEADER - 0.05
-        self._alt = ""
+        self._await_opponent = False
+        self._candidate = self.pending
+        self._candidate_hits = 1
+        self._retry_prompt = self.pending
         self._reject_hits = 0
-        self._retry_prompt = prompt
 
     def _blank(self) -> dict:
-        return {
-            "play": "",
-            "stored": "",
-            "candidates": [],
-            "accepted": False,
-            "rejected": False,
-            "board": self.pending,
-            "turn": self.turn,
-            "partials": list(self._last_reads),
-        }
+        return {"play": "", "stored": "", "candidates": [], "accepted": False,
+                "rejected": False, "board": self.pending, "turn": self.turn,
+                "partials": list(self._last_reads), "given": self._recovery_given,
+                "ending": ""}
 
     def _remember(self, board: str) -> None:
-        if len(board) < 2:
+        if len(board) < 2 or board == self.typed:
             return
-        if self._memory and self._memory[-1] == board:
-            return
-        self._memory.append(board)
-        if len(self._memory) > 32:
-            self._memory = self._memory[-24:]
-        self._last_reads = [word for word in self._memory if len(word) >= 4]
+        if not self._memory or self._memory[-1] != board:
+            self._memory.append(board)
+            self._memory = self._memory[-32:]
+        self._last_reads = list(self._memory)
 
-    def _candidates(self, prefix: str) -> list[str]:
+    @staticmethod
+    def _prompt(board: str) -> str:
+        return board if board.isalpha() and 1 <= len(board) <= 4 else ""
 
-        if not prefix:
-            return []
-        out: list[str] = []
-        seen: set[str] = set()
-        for word in self._memory:
-            if word in seen or len(word) <= len(prefix) or not word.endswith(prefix):
-                continue
-            seen.add(word)
-            out.append(word)
-        if self.pending and self.pending not in seen and self._is_submit(self.pending, prefix):
-            out.append(self.pending)
-        return out
-
-    def _mark_accepted(self, out: dict) -> None:
-        out["accepted"] = True
-        self.typed = ""
-        self.played = ""
-        self._memory = []
-        self._reject_hits = 0
-        self._alt = ""
-        self._hold = ""
-        self._ours_since = None
-        self._need_their_turn = True
-        self._saw_theirs = False
-        self._saw_long = False
-        self._released = False
-
-    def _note_long(self, board: str, whose: str) -> None:
-        if len(board) <= 4 or self.typed:
-            return
-        self._saw_long = True
-        self._hold = ""
-        if whose != "ours":
-            self._saw_theirs = True
-
-    def _arm_play(self, out: dict, prompt: str, whose: str, now: float) -> None:
-
-        prompt = self._prompt(prompt)
-        if whose == "theirs":
-            self._saw_theirs = True
-            self._ours_since = None
-            self._hold = ""
-            if prompt:
-                self._opponent_prompt = prompt
-                self._released = False
-            return
-        if whose != "ours" or not prompt or prompt == self.played:
-            return
-        if self._ours_since is None:
-            self._ours_since = now
-        if prompt != self._hold:
-            self._hold = prompt
-            self._hold_at = now
-            return
-        need = _PREFIX_SETTLE_FULL if len(prompt) >= 4 else _PREFIX_SETTLE
-        if now - self._hold_at < need or now - self._ours_since < _OURS_HEADER:
-            return
-        if self._need_their_turn and not (self._saw_theirs or self._saw_long or self._released):
-            return
-        if prompt == self._opponent_prompt and not self._released and now - self._ours_since < _SAME_PROMPT:
-            return
-        out["play"] = prompt
-        self._need_their_turn = True
-        self._saw_theirs = False
-        self._saw_long = False
-        self._released = False
-        self._opponent_prompt = ""
-        self._hold = ""
-        self._ours_since = None
-
-    def _allow_retry(self) -> None:
-        self._need_their_turn = False
-        self._released = True
-        self._opponent_prompt = ""
-        self._ours_since = None
-
-    def observe(
-        self,
-        board: str,
-        whose: str,
-        *,
-        complete: bool = True,
-        tiles: int = 0,
-        now: float | None = None,
-    ) -> dict:
-        board = re.sub(r"[^a-z]", "", (board or "").lower())
+    def observe(self, board: str, whose: str, *, complete: bool = True,
+                tiles: int = 0, now: float | None = None) -> dict:
+        board = re.sub(r"[^a-z?]", "", (board or "").lower())
         whose = whose if whose in ("ours", "theirs") else ""
-        if now is None:
-            now = self._clock
-        else:
-            self._clock = now
-        if not complete:
-
-            if tiles and self._hold and tiles > len(self._hold):
-                self._hold_at = now
-            board = ""
+        self._clock = now if now is not None else self._clock
+        complete = complete and "?" not in board and (not tiles or tiles == len(board))
         out = self._blank()
+        previous_turn = self.turn
+        previous_board = self.pending
+        prompt = self._prompt(board) if complete else ""
 
-        if not board:
-            if self.typed and whose == "theirs":
-                self._mark_accepted(out)
-                self.turn = "theirs"
-            out["board"] = self.pending
-            out["turn"] = self.turn
-            out["partials"] = list(self._last_reads)
-            return out
-
-        if self._retry_prompt:
-            if board == self._retry_prompt:
-                self._retry_prompt = ""
-            elif board.startswith(self._retry_prompt):
-                out["board"] = self._retry_prompt
-                out["turn"] = "ours"
-                self.turn = "ours"
-                return out
-
-        if (
-            len(board) >= 4
-            and not self.typed
-            and not (self.played and board.startswith(self.played))
-            and (len(board) > 4 or self.turn == "theirs" or whose == "theirs")
-        ):
-            self._remember(board)
-        out["partials"] = list(self._last_reads)
-
+        # Submission is not acceptance. A new speaker or the submitted word's
+        # ending becoming the board confirms that Enter was accepted.
         if self.typed:
-            still_ours = board.startswith(self.pending) and len(board) >= len(self.pending) and whose != "theirs"
-            if still_ours and not (len(board) <= 4 and board != self.played and self.typed.endswith(board)):
-                self.pending = board
-                self.turn = whose or self.turn or "ours"
-                out["board"] = board
-                out["turn"] = self.turn
-                return out
-            same_stem = board == self.played and self.typed.endswith(board)
-            accepted = whose == "theirs" or (
-                len(board) <= 4
-                and len(self.typed) > len(board)
-                and self.typed.endswith(board)
-                and board != self.played
-            )
-            if accepted:
-                self._mark_accepted(out)
-                self.pending = board
+            collapsed = bool(prompt and prompt != self.played and len(self.typed) > len(prompt)
+                             and self.typed.endswith(prompt) and board != previous_board)
+            if whose == "theirs" or collapsed:
+                out["accepted"] = True
+                expected = self.typed[-len(prompt):] if prompt else ""
+                self.typed = ""
+                self.played = ""
+                self._await_opponent = True
+                self._opponent_active = True
+                self._memory = []
+                self._last_reads = []
+                self._given = prompt if prompt == expected else ""
+                self._candidate = ""
+                self._candidate_hits = 0
+                self._reject_hits = 0
+                # Header can lag the board by one capture; do not replay it.
                 self.turn = "theirs"
-                if self._prompt(board):
-                    self._opponent_prompt = board
-                elif len(board) > 4:
-                    self._remember(board)
-                out["board"] = board
-                out["turn"] = self.turn
-                return out
-            if same_stem and whose != "theirs":
-                self._reject_hits += 1
-                if self._reject_hits >= 8:
-                    out["rejected"] = True
-                    self.typed = ""
-                    self.played = ""
+                if board:
                     self.pending = board
-                    self._memory = []
-                    self._reject_hits = 0
-                    self.turn = "ours"
-                    self._allow_retry()
-                out["board"] = self.pending
-                out["turn"] = self.turn
+                out.update(board=self.pending, turn=self.turn, partials=[])
                 return out
-            if board == self.played and whose != "theirs" and len(self.pending) > len(board):
+            if complete and board == self.played and len(previous_board) > len(board):
                 self._reject_hits += 1
                 if self._reject_hits >= 2:
                     out["rejected"] = True
                     self.typed = ""
                     self.played = ""
-                    self.pending = board
-                    self._memory = []
-                    self._reject_hits = 0
-                    self.turn = "ours"
-                    self._allow_retry()
-                out["board"] = self.pending
-                out["turn"] = self.turn
-                return out
-            self.pending = board
-            out["board"] = board
-            out["turn"] = self.turn
-            return out
-
-        self._reject_hits = 0
-
-        if self.played and whose != "theirs" and self.turn != "theirs" and board.startswith(self.played):
-            if len(board) >= len(self.pending):
-                self.pending = board
-            out["board"] = board
-            out["turn"] = "ours"
-            self.turn = "ours"
-            return out
-
-        if self.pending and board.startswith(self.pending) and len(board) > len(self.pending):
-            self.pending = board
-            self._note_long(board, whose)
-            if whose == "theirs":
-                self.turn = "theirs"
-                self._remember(board)
-            elif whose == "ours":
-                self.turn = "ours"
-            elif self.turn != "ours":
-                self.turn = "theirs"
-                self._remember(board)
-            if self._prompt(board):
-                self._arm_play(out, board, whose, now)
-            out["board"] = board
-            out["turn"] = self.turn
-            return out
-
-        fresh_turn = self.turn == "theirs" or self._saw_long
-        if self._collapsed_to(board) and fresh_turn:
-            options = self._candidates(board)
-            out["candidates"] = options
-            out["stored"] = max(options, key=len) if options else ""
-            self._memory = []
-            self.pending = board
-            self.played = ""
-            self._alt = ""
-            self._released = True
-            self._opponent_prompt = ""
-            self._saw_long = True
-            prompt = self._prompt(board)
-            if whose == "theirs":
-                self.turn = "theirs"
-                self._saw_theirs = True
+                    self._await_opponent = False
             else:
-                self.turn = "ours"
-                if prompt:
-                    self._arm_play(out, prompt, whose, now)
-            out["board"] = board
-            out["turn"] = self.turn
-            return out
-
-        if board == self.pending:
-            if whose == "theirs":
-                self.turn = "theirs"
-                self._saw_theirs = True
-                self._ours_since = None
-                self._hold = ""
-                if self._prompt(board):
-                    self._opponent_prompt = board
-                    self._released = False
-                else:
-                    self._note_long(board, whose)
-                self._remember(board)
-                out["board"] = board
-                out["turn"] = "theirs"
-                return out
-            if whose:
-                self.turn = whose
-            self._note_long(board, whose)
-            prompt = self._prompt(board) if whose == "ours" else ""
-            if prompt:
-                self._arm_play(out, prompt, whose, now)
-            out["board"] = board
-            out["turn"] = self.turn
-            return out
-
-        if len(board) > 4 and whose != "ours":
-            self.pending = board
-            self.turn = "theirs"
-            self._remember(board)
-            self._note_long(board, whose)
-            self._alt = ""
-            out["board"] = board
-            out["turn"] = "theirs"
-            return out
-
-        if len(board) > 4 and whose == "ours":
-            self._note_long(board, whose)
-            self._remember(board)
-            self.pending = board
-            self._alt = ""
-            out["board"] = board
-            out["turn"] = self.turn
-            return out
-
-        if self._prompt(board) and whose == "ours":
-            self.pending = board
-            self.turn = "ours"
-            self._alt = ""
-            self._arm_play(out, board, whose, now)
-            out["board"] = board
-            out["turn"] = "ours"
+                self._reject_hits = 0
+            if board and complete:
+                self.pending = board
+            out.update(board=self.pending, turn=self.turn)
             return out
 
         if whose == "theirs":
-            self.pending = board
+            if previous_turn != "theirs" and not self._opponent_active:
+                self._memory = []
+                self._last_reads = []
+                self._given = prompt
+            if not self._given and prompt and not self._memory:
+                self._given = prompt
+            self._opponent_active = True
+            self._await_opponent = False
             self.turn = "theirs"
+            self._candidate = ""
+            self._candidate_hits = 0
             self._remember(board)
-            self._alt = ""
-            self._arm_play(out, board, whose, now)
-            out["board"] = board
-            out["turn"] = "theirs"
+            if complete and board:
+                self.pending = board
+            out.update(board=self.pending, turn=self.turn, partials=list(self._last_reads))
             return out
 
-        if board == self._alt:
-            self.pending = board
-            self.turn = whose or self.turn
-            self._alt = ""
-            self._note_long(board, whose)
-            if self.turn == "theirs":
-                self._remember(board)
-            prompt = self._prompt(board) if whose == "ours" else ""
-            if prompt:
-                self._arm_play(out, prompt, whose, now)
-            out["board"] = board
-            out["turn"] = self.turn
+        # Record the last long reading even if the header has already flipped.
+        if self._opponent_active and board and not prompt:
+            self._remember(board)
+        if not complete or not board:
+            self._candidate = ""
+            self._candidate_hits = 0
+            out.update(partials=list(self._last_reads))
             return out
-        self._alt = board
-        out["board"] = self.pending
-        out["turn"] = self.turn
+
+        if whose != "ours":
+            # A blank/unread header is never authority to start typing.
+            out.update(board=self.pending, partials=list(self._last_reads))
+            return out
+
+        if self._opponent_active and prompt:
+            if board == previous_board and self._given and len(board) > len(self._given):
+                # A 2–4 letter prefix is often already on screen while the
+                # header still names the opponent, and it is longer than the
+                # prefix they were given. Their own short word is the only
+                # reading we have in that case; a prefix we watched them play
+                # toward is shorter than that word. Hold the short word briefly
+                # so it can collapse, then accept a prefix that stays.
+                longer = any(len(word) > len(board) and "?" not in word for word in self._memory)
+                if not longer:
+                    if self._hold_board != board:
+                        self._hold_board = board
+                        self._hold_since = self._clock
+                    if self._clock - self._hold_since < 0.25:
+                        out.update(partials=list(self._last_reads))
+                        return out
+                    self._candidate = prompt
+                    self._candidate_hits = 1
+            self._hold_board = ""
+            # A header change cannot, by itself, turn their final short word
+            # into a prefix. The branch above waits for that word to collapse.
+            self._recovery_pending = True
+            # Attaching mid-turn can make the first short read a finished word,
+            # rather than a starting prefix. Keep that reading too.
+            self._recovery_given = (self._given if any(len(word) > len(self._given)
+                                                      for word in self._memory) else "")
+            self._opponent_active = False
+            self._await_opponent = False
+            self.played = ""
+            self._last_reads = list(self._memory)
+            self._memory = []
+            self._given = ""
+
+        self.turn = "ours"
+        self.pending = board
+        out.update(board=board, turn=self.turn, partials=list(self._last_reads), given=self._recovery_given)
+        if self._recovery_pending and prompt:
+            options = [word for word in self._last_reads if "?" not in word
+                       and len(word) > len(prompt) and word.endswith(prompt)
+                       and (not self._recovery_given or word.startswith(self._recovery_given))]
+            out.update(candidates=options, stored=max(options, key=len) if options else "")
+        # "i" can confirm before the rest of "is" lands. A latched short word
+        # can also collapse to the ending that is the real prefix. A different
+        # word (their "wow" while we still hold "sk") must not steal the latch.
+        grew = prompt.startswith(self.played) and len(prompt) > len(self.played)
+        collapsed = self.played.endswith(prompt) and len(self.played) > len(prompt)
+        if whose == "ours" and prompt and self.played and not self.typed and (grew or collapsed):
+            self.played = ""
+            self._candidate = ""
+            self._candidate_hits = 0
+        if not prompt or self.played or self._await_opponent:
+            return out
+        if self._retry_prompt and prompt != self._retry_prompt:
+            return out
+        if prompt == self._candidate:
+            self._candidate_hits += 1
+        else:
+            self._candidate, self._candidate_hits = prompt, 1
+        if self._candidate_hits < 2:
+            return out
+        self._retry_prompt = ""
+        out["play"] = prompt
+        if self._recovery_pending:
+            options = [word for word in self._last_reads if "?" not in word
+                       and len(word) > len(prompt) and word.endswith(prompt)
+                       and (not self._recovery_given or word.startswith(self._recovery_given))]
+            out.update(candidates=options, stored=max(options, key=len) if options else "", ending=prompt)
+            self._recovery_pending = False
         return out
-
-    @staticmethod
-    def _prompt(board: str) -> str:
-        if board.isalpha() and 1 <= len(board) <= 4:
-            return board
-        return ""
-
-    @staticmethod
-    def _is_submit(previous: str, current: str) -> bool:
-        if len(previous) < 2 or not current or len(current) > 4 or len(previous) <= len(current):
-            return False
-        return previous.endswith(current)
-
-    def _collapsed_to(self, board: str) -> bool:
-        if self._is_submit(self.pending, board):
-            return True
-        return any(self._is_submit(word, board) for word in self._memory)
 
 def finished_word(previous: str, current: str) -> Optional[str]:
 
@@ -611,47 +400,59 @@ class MatchSession:
         self.engine.mark_used(best)
         return best
 
-    def recover_partial(self, partials: list, ending: str) -> str:
+    def recover_partial(self, partials: list, ending: str, given: str = "") -> str:
+        """Recover using the longest reading, its tile slots, and both prefixes.
 
+        A complete valid reading wins. A clipped reading is completed only when
+        the least missing letters uniquely identify a word; ties stay unresolved.
+        """
         ending = re.sub(r"[^a-z]", "", (ending or "").lower())
+        given = re.sub(r"[^a-z]", "", (given or "").lower())
         if not 1 <= len(ending) <= 4:
             return ""
-        fragments: list[str] = []
-        for raw in partials or []:
-            cleaned = re.sub(r"[^a-z]", "", (raw or "").lower())
-            if len(cleaned) < 4 or cleaned == ending or cleaned in fragments:
-                continue
-            fragments.append(cleaned)
-        fragments.sort(key=len, reverse=True)
-        wordlist = self.engine.wordlist
-        for partial in fragments:
-            if (
-                partial.endswith(ending)
-                and len(partial) > len(ending)
-                and partial != self.last_word
-                and self.engine._is_known_word(partial)
-            ):
-                self.engine.mark_used(partial)
-                return partial
-            start = bisect_left(wordlist, partial)
-            stop = bisect_right(wordlist, partial + "\uffff")
-            best = ""
-            best_len = 0
-            ties = 0
-            for word in wordlist[start:stop]:
-                gap = len(word) - len(partial)
-                if gap <= 0 or gap > 5 or not word.endswith(ending) or len(word) <= len(ending):
+        fragments = {re.sub(r"[^a-z?]", "", str(raw).lower()) for raw in partials or []}
+        fragments = [f for f in fragments if len(f.replace("?", "")) >= 2
+                     and f != given and f != ending]
+        if not fragments:
+            return ""
+        longest = max(len(f) for f in fragments)
+        fragments = [f for f in fragments if len(f) == longest]
+        exact = {f for f in fragments if "?" not in f and f.startswith(given)
+                 and f.endswith(ending) and self.engine._is_known_word(f)}
+        if len(exact) == 1:
+            best = exact.pop()
+        else:
+            candidates: dict[str, int] = {}
+            for fragment in fragments:
+                stem = fragment.split("?", 1)[0]
+                if given and stem and not (stem.startswith(given) or given.startswith(stem)):
                     continue
-                if not best or len(word) < best_len:
-                    best = word
-                    best_len = len(word)
-                    ties = 1
-                elif len(word) == best_len:
-                    ties += 1
-            if best and ties == 1:
-                self.engine.mark_used(best)
-                return best
-        return ""
+                stem = stem or given
+                if not stem:
+                    continue
+                start = bisect_left(self.engine.wordlist, stem)
+                stop = bisect_right(self.engine.wordlist, stem + "\uffff")
+                for index in range(start, stop):
+                    word = self.engine.wordlist[index]
+                    gap = len(word) - len(fragment)
+                    if gap < 0 or gap > 8 or len(word) <= len(ending):
+                        continue
+                    if not word.startswith(given) or not word.endswith(ending):
+                        continue
+                    if not all(a == "?" or a == b for a, b in zip(fragment, word)):
+                        continue
+                    candidates[word] = gap
+            if not candidates:
+                return ""
+            missing = min(candidates.values())
+            best_options = [word for word, gap in candidates.items() if gap == missing]
+            if len(best_options) != 1:
+                return ""
+            best = best_options[0]
+        if best in self.engine.used_words:
+            return ""
+        self.engine.mark_used(best)
+        return best
 
     def note_opponent_bridge(self, word: str, given: str, nxt: str) -> bool:
 

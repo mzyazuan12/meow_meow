@@ -1,487 +1,161 @@
+"""Read the prompt tiles and the turn header from one RGBA Roblox frame."""
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
+import hashlib
+from collections import OrderedDict
+from typing import List, Optional, Tuple
 
-GRID = 16
-CELLS = GRID * GRID
+import numpy as np
 
-_TEMPLATES: list[list[list[float]]] = []
-_TNORM: list[list[float]] = []
-_PHRASE = "type an english word"
-_TURN_MARK = "starting"
-_PHRASE_BITS: list[tuple[int, int, bytes]] = []
+from autotype import glyphs
 
-def _font_files() -> list[Path]:
-    found: list[Path] = []
-    if sys.platform == "win32":
-        root = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-        names = ["arialbd.ttf", "ariblk.ttf", "segoeuib.ttf", "calibrib.ttf", "arial.ttf"]
-        found.extend(root / name for name in names)
-    elif sys.platform == "darwin":
-        roots = [
-            Path("/System/Library/Fonts/Supplemental"),
-            Path("/System/Library/Fonts"),
-            Path("/Library/Fonts"),
-        ]
-        names = [
-            "Arial Bold.ttf",
-            "Arial Rounded Bold.ttf",
-            "Arial.ttf",
-            "Avenir.ttc",
-            "GillSans.ttc",
-        ]
-        for root in roots:
-            found.extend(root / name for name in names)
-    else:
-        found.extend(
-            [
-                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-                Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
-                Path("/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
-            ]
-        )
-    return [path for path in found if path.is_file()]
+Box = Tuple[int, int, int, int]
 
-def _density(raw: bytes, width: int, height: int, stride: int) -> list[float]:
-    grid = [0.0] * CELLS
-    minx, miny, maxx, maxy = width, height, -1, -1
-    for y in range(height):
-        row = y * width * stride
-        for x in range(width):
-            i = row + x * stride
-            if raw[i] >= 150 or raw[i + 1] >= 150 or raw[i + 2] >= 150:
-                continue
-            if x < minx:
-                minx = x
-            if x > maxx:
-                maxx = x
-            if y < miny:
-                miny = y
-            if y > maxy:
-                maxy = y
-    if maxx < minx:
-        return grid
-    bw = maxx - minx + 1
-    bh = maxy - miny + 1
-    side = bw if bw > bh else bh
-    ox = minx - (side - bw) // 2
-    oy = miny - (side - bh) // 2
-    for gy in range(GRID):
-        sy = oy + gy * side // GRID
-        sy1 = oy + (gy + 1) * side // GRID
-        if sy1 <= sy:
-            sy1 = sy + 1
-        for gx in range(GRID):
-            sx = ox + gx * side // GRID
-            sx1 = ox + (gx + 1) * side // GRID
-            if sx1 <= sx:
-                sx1 = sx + 1
-            ink = 0
-            tot = 0
-            for y in range(sy, sy1):
-                if y < 0 or y >= height:
-                    continue
-                row = y * width * stride
-                for x in range(sx, sx1):
-                    if x < 0 or x >= width:
-                        continue
-                    tot += 1
-                    i = row + x * stride
-                    if raw[i] < 150 and raw[i + 1] < 150 and raw[i + 2] < 150:
-                        ink += 1
-            grid[gy * GRID + gx] = (ink / tot) if tot else 0.0
-    return grid
 
-def _norm(grid: list[float]) -> float:
-    return sum(v * v for v in grid) ** 0.5
+def label_runs(mask: np.ndarray, eight: bool = False):
+    """Connected components of a boolean image, via horizontal runs.
 
-def _ensure_templates() -> None:
-    if _TEMPLATES:
-        return
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError:
-        return
-    for path in _font_files():
-        if len(_TEMPLATES) >= 6:
-            break
-        try:
-            font = ImageFont.truetype(str(path), 120)
-        except OSError:
-            continue
-        for lower in (False, True):
-            if len(_TEMPLATES) >= 6:
-                break
-            pack: list[list[float]] = []
-            norms: list[float] = []
-            for index in range(26):
-                ch = chr((ord("a") if lower else ord("A")) + index)
-                image = Image.new("RGB", (180, 180), "white")
-                draw = ImageDraw.Draw(image)
-                draw.text((30, 20), ch, fill="black", font=font)
-                grid = _density(image.tobytes(), 180, 180, 3)
-                pack.append(grid)
-                norms.append(_norm(grid))
-            _TEMPLATES.append(pack)
-            _TNORM.append(norms)
-        try:
-            phrase_font = ImageFont.truetype(str(path), 28)
-        except OSError:
-            phrase_font = None
-        if phrase_font is not None and len(_PHRASE_BITS) < 3:
-            image = Image.new("L", (420, 48), 0)
-            draw = ImageDraw.Draw(image)
-            draw.text((4, 6), _PHRASE, fill=255, font=phrase_font)
-            _PHRASE_BITS.append((420, 48, image.tobytes()))
+    Returns (runs, labels, count): runs is an (n, 3) array of (y, x0, x1) and
+    labels gives each run's component, numbered 0..count-1.
+    """
+    h, w = mask.shape
+    padded = np.zeros((h, w + 2), np.int8)
+    padded[:, 1:-1] = mask
+    edges = np.diff(padded, axis=1)
+    ys, x0 = np.nonzero(edges == 1)
+    _ye, x1 = np.nonzero(edges == -1)
+    n = len(ys)
+    if not n:
+        return np.zeros((0, 3), np.int64), np.zeros(0, np.int64), 0
+    parent = list(range(n))
 
-def _cosine(tile: list[float], tmpl: list[float], tnorm: float) -> float:
-    dot = 0.0
-    norm = 0.0
-    for a, b in zip(tile, tmpl):
-        dot += a * b
-        norm += a * a
-    if norm < 1e-6 or tnorm < 1e-6:
-        return 0.0
-    return dot / ((norm ** 0.5) * tnorm)
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
 
-def settle_qo(raw: bytes, width: int, height: int, stride: int, guess: str) -> str:
+    starts = np.searchsorted(ys, np.arange(h + 1)).tolist()
+    xs0 = x0.tolist()
+    xs1 = x1.tolist()
+    slack = 1 if eight else 0
+    for row in range(1, h):
+        a, a_end = starts[row - 1], starts[row]
+        b, b_end = starts[row], starts[row + 1]
+        while a < a_end and b < b_end:
+            if xs0[a] < xs1[b] + slack and xs0[b] < xs1[a] + slack:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+            if xs1[a] < xs1[b]:
+                a += 1
+            else:
+                b += 1
+    roots = [find(i) for i in range(n)]
+    _uniq, labels = np.unique(np.asarray(roots), return_inverse=True)
+    runs = np.stack([ys, x0, x1], axis=1)
+    return runs, labels, int(labels.max()) + 1
 
-    if guess not in ("q", "o") or width < 8 or height < 8 or stride < 3:
-        return guess
-    minx, miny, maxx, maxy = width, height, -1, -1
-    for y in range(height):
-        row = y * width * stride
-        for x in range(width):
-            i = row + x * stride
-            if raw[i] >= 150 or raw[i + 1] >= 150 or raw[i + 2] >= 150:
-                continue
-            if x < minx:
-                minx = x
-            if x > maxx:
-                maxx = x
-            if y < miny:
-                miny = y
-            if y > maxy:
-                maxy = y
-    if maxx < minx:
-        return guess
-    bw = maxx - minx + 1
-    bh = maxy - miny + 1
-    if bw < 8 or bh < 8:
-        return guess
-    need = bh // 10
-    if need < 2:
-        need = 2
-    got = 0
-    total = 0
-    acc = 0
-    for y in range(maxy, miny - 1, -1):
-        row = y * width * stride
-        count = 0
-        summed = 0
-        for x in range(minx, maxx + 1):
-            i = row + x * stride
-            if raw[i] < 150 and raw[i + 1] < 150 and raw[i + 2] < 150:
-                count += 1
-                summed += x
-        if not count:
-            continue
-        got += 1
-        total += count
-        acc += summed
-        if got >= need:
-            break
-    if total < 3:
-        return guess
-    rel = (acc / total - minx) / bw
-    if rel >= 0.54:
-        return "q"
-    if rel <= 0.53:
-        return "o"
-    return guess
 
-def _classify(raw: bytes, width: int, height: int, stride: int) -> str:
-    _ensure_templates()
-    if not _TEMPLATES:
-        return ""
-    tile = _density(raw, width, height, stride)
-    best = 0.0
-    second = 0.0
-    letter = ""
-    for pack, norms in zip(_TEMPLATES, _TNORM):
-        top = -1.0
-        nxt = -1.0
-        top_i = 0
-        for index, (tmpl, tnorm) in enumerate(zip(pack, norms)):
-            score = _cosine(tile, tmpl, tnorm)
-            if score > top:
-                nxt = top
-                top = score
-                top_i = index
-            elif score > nxt:
-                nxt = score
-        if top > best:
-            best = top
-            second = nxt
-            letter = chr(ord("a") + top_i)
-        if best >= 0.9 and best - second >= 0.04:
-            break
-    if letter in ("q", "o") and best >= 0.62:
-        return settle_qo(raw, width, height, stride, letter)
-    if best >= 0.62 and best - second >= 0.03:
-        return letter
-    return ""
+def component_boxes(runs: np.ndarray, labels: np.ndarray, count: int) -> np.ndarray:
+    """(count, 5) array of x0, y0, x1 (exclusive), y1 (exclusive), area."""
+    out = np.zeros((count, 5), np.int64)
+    out[:, 0] = np.iinfo(np.int64).max
+    out[:, 1] = np.iinfo(np.int64).max
+    if not count:
+        return out
+    np.minimum.at(out[:, 0], labels, runs[:, 1])
+    np.minimum.at(out[:, 1], labels, runs[:, 0])
+    np.maximum.at(out[:, 2], labels, runs[:, 2])
+    np.maximum.at(out[:, 3], labels, runs[:, 0] + 1)
+    np.add.at(out[:, 4], labels, runs[:, 2] - runs[:, 1])
+    return out
 
-def _is_white(raw: bytes, i: int) -> bool:
-    r = raw[i]
-    g = raw[i + 1]
-    b = raw[i + 2]
-    hi = r if r > g else g
-    if b > hi:
-        hi = b
-    lo = r if r < g else g
-    if b < lo:
-        lo = b
-    return lo > 198 and hi - lo < 40
 
-def _components(mask: bytearray, width: int, height: int) -> list[tuple[int, int, int, int, int]]:
-    parent: list[int] = []
+def _component_mask(runs: np.ndarray, box) -> np.ndarray:
+    x0, y0, x1, y1 = (int(v) for v in box[:4])
+    mask = np.zeros((y1 - y0, x1 - x0), bool)
+    for y, a, b in runs.tolist():
+        mask[y - y0, a - x0:b - x0] = True
+    return mask
 
-    def find(node: int) -> int:
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
 
-    runs: list[tuple[int, int, int, int]] = []
-    prev: list[tuple[int, int, int]] = []
-    for y in range(height):
-        row = y * width
-        x = 0
-        line: list[tuple[int, int, int]] = []
-        while x < width:
-            if not mask[row + x]:
-                x += 1
-                continue
-            x0 = x
-            x += 1
-            while x < width and mask[row + x]:
-                x += 1
-            cid = len(parent)
-            parent.append(cid)
-            for px0, px1, pid in prev:
-                if px1 <= x0 or px0 >= x:
-                    continue
-                root = find(cid)
-                other = find(pid)
-                if root != other:
-                    parent[other] = root
-            line.append((x0, x, cid))
-            runs.append((y, x0, x, cid))
-        prev = line
-    boxes: dict[int, list[int]] = {}
-    for y, x0, x1, cid in runs:
-        root = find(cid)
-        box = boxes.get(root)
-        if box is None:
-            boxes[root] = [x0, y, x1 - 1, y, x1 - x0]
-        else:
-            if x0 < box[0]:
-                box[0] = x0
-            if y < box[1]:
-                box[1] = y
-            if x1 - 1 > box[2]:
-                box[2] = x1 - 1
-            if y > box[3]:
-                box[3] = y
-            box[4] += x1 - x0
-    return [tuple(box) for box in boxes.values()]
+# --- prompt tiles --------------------------------------------------------------
 
-def _crop(raw: bytes, width: int, stride: int, x: int, y: int, w: int, h: int) -> bytes:
-    out = bytearray(w * h * stride)
-    for row in range(h):
-        start = ((y + row) * width + x) * stride
-        out[row * w * stride : (row + 1) * w * stride] = raw[start : start + w * stride]
-    return bytes(out)
+def _white(rgb: np.ndarray) -> np.ndarray:
+    lo = rgb.min(axis=2)
+    hi = rgb.max(axis=2)
+    return (lo > 198) & ((hi - lo) < 40)
 
-_HEADER_KEY = None
-_HEADER_VALUE = ""
 
-def _header_text(raw: bytes, width: int, height: int, stride: int, name: str) -> str:
-    global _HEADER_KEY, _HEADER_VALUE
-    _ensure_templates()
-    if not _font_files():
-        return ""
-    band_h = max(8, int(height * 0.16))
-    acc = 2166136261
-    for y in range(0, band_h, 6):
-        row = y * width * stride
-        for x in range(0, width * stride, 24):
-            acc ^= raw[row + x]
-            acc = (acc * 16777619) & 0xFFFFFFFF
-    key = (acc, name)
-    if key == _HEADER_KEY:
-        return _HEADER_VALUE
-    band_h = max(8, int(height * 0.16))
+def _dark(rgb: np.ndarray) -> np.ndarray:
+    return rgb.max(axis=2) < 150
 
-    step = 1
-    sw = width // step
-    sh = band_h // step
-    if sw < 20 or sh < 8:
-        _HEADER_KEY = key
-        _HEADER_VALUE = ""
-        return ""
-    bits = bytearray(sw * sh)
-    for y in range(sh):
-        sy = y * step
-        for x in range(sw):
-            sx = x * step
-            i = (sy * width + sx) * stride
-            if _is_white(raw, i):
-                bits[y * sw + x] = 1
-    phrase_hit = _text_hit(bits, sw, sh, _TURN_MARK)
-    text = ""
-    if phrase_hit:
-        cleaned = "".join(ch for ch in (name or "").lower() if ch.isalnum())
-        name_hit = len(cleaned) >= 3 and _text_hit(bits, sw, sh, cleaned)
-        if name_hit:
-            text = f"{name}, type an english word starting with:"
-        else:
-            text = "opponent, type an english word starting with:"
-    _HEADER_KEY = key
-    _HEADER_VALUE = text
-    return text
 
-def _text_line(bits: bytearray, width: int, height: int) -> tuple[int, int] | None:
-    rows = [y for y in range(height) if sum(bits[y * width : (y + 1) * width]) > max(8, width // 80)]
-    if not rows:
-        return None
-    start = rows[0]
-    best = (rows[0], rows[0], 1)
-    prev = rows[0]
-    for y in rows[1:]:
-        if y > prev + 2:
-            start = y
-        prev = y
-        if y - start > best[1] - best[0]:
-            best = (start, y, y - start)
-    return best[0], best[1]
-
-def _text_hit(bits: bytearray, width: int, height: int, text: str) -> bool:
-    line = _text_line(bits, width, height)
-    if line is None:
-        return False
-    y0, y1 = line
-    line_h = y1 - y0 + 1
-    if line_h < 8:
-        return False
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError:
-        return False
-    path = next(iter(_font_files()), None)
-    if path is None:
-        return False
-    best = 0.0
-    for size in range(max(12, line_h), line_h + 6, 2):
-        try:
-            font = ImageFont.truetype(str(path), size)
-        except OSError:
-            return False
-        image = Image.new("L", (max(32, len(text) * size), size + 12), 0)
-        ImageDraw.Draw(image).text((0, 2), text, fill=255, font=font)
-        bbox = image.getbbox()
-        if not bbox:
-            continue
-        tight = image.crop(bbox)
-        raw = tight.tobytes()
-        nw, nh = tight.size
-        if nw >= width or nh < 4 or y0 + nh > height:
-            continue
-        ink = [(x, y) for y in range(0, nh, 2) for x in range(0, nw, 2) if raw[y * nw + x] > 180]
-        if len(ink) < 8:
-            continue
-        for x0 in range(0, max(1, width - nw), 3):
-            hit = 0
-            for x, y in ink:
-                if bits[(y0 + y) * width + (x0 + x)]:
-                    hit += 1
-            score = hit / len(ink)
-            if score > best:
-                best = score
-            if best >= 0.88:
-                return True
-    return best >= 0.8
-
-def scan_rgba(raw: bytes, width: int, height: int, name: str = "") -> dict:
-
-    if width < 8 or height < 8 or len(raw) < width * height * 4:
-        return {"prompt": "", "header": "", "tiles": 0, "ms": 0, "full": False}
-    header = _header_text(raw, width, height, 4, name)
-    y0 = int(height * 0.04)
-    y1 = int(height * 0.74)
+def find_tiles(rgb: np.ndarray) -> List[Box]:
+    """Boxes of the white interiors of the tile row, left to right."""
+    height, width = rgb.shape[:2]
+    y0, y1 = int(height * 0.04), int(height * 0.74)
     if y1 <= y0 + 8:
-        y1 = height
-    step = 2 if width >= 700 else 1
-    mw = width // step
-    mh = (y1 - y0) // step
-    mask = bytearray(mw * mh)
-    for y in range(mh):
-        sy = y0 + y * step
-        src = sy * width * 4
-        row = y * mw
-        for x in range(mw):
-            if _is_white(raw, src + x * step * 4):
-                mask[row + x] = 1
-    scale = width / 900.0
-    if scale < 0.65:
-        scale = 0.65
-    min_side = int(26 * scale) // step
-    max_side = int(190 * scale) // step
-    if min_side < 8:
-        min_side = 8
-    tiles = []
-    for x0, y0b, x1, y1b, count in _components(mask, mw, mh):
-        bw = x1 - x0 + 1
-        bh = y1b - y0b + 1
+        y0, y1 = 0, height
+    step = 2 if min(width, height) >= 900 else 1
+    band = rgb[y0:y1:step, ::step]
+    runs, labels, count = label_runs(_white(band))
+    boxes = component_boxes(runs, labels, count)
+    # Tiles are far larger than the header's letter fills, which are also
+    # white and outlined. 4% of the short side clears that text on every
+    # window size and still keeps a tile (they run about 7–20%).
+    short = min(width, height)
+    min_side = max(8, int(short * 0.04)) // step
+    max_side = max(min_side + 4, int(short * 0.32)) // step
+    cand: List[Box] = []
+    for bx0, by0, bx1, by1, area in boxes.tolist():
+        bw, bh = bx1 - bx0, by1 - by0
         if bw < min_side or bh < min_side or bw > max_side or bh > max_side:
             continue
-        if abs(bw - bh) > bw / 5:
+        if abs(bw - bh) > bw / 5 or area < 0.45 * bw * bh:
             continue
-        fill = count / float(bw * bh)
-        if fill < 0.45 or fill > 0.96:
-            continue
-        tiles.append((x0 * step, y0 + y0b * step, bw * step, bh * step))
-    tiles.sort(key=lambda box: box[0])
-    row = _best_row(tiles)
-    letters = []
-    pad = max(step, 2)
-    for x, y, w, h in row:
+        cand.append((bx0 * step, y0 + by0 * step, bw * step, bh * step))
+    # A letter's own white body is a small square inside its tile.
+    outer = [b for b in cand if not any(o is not b and _inside(b, o) for o in cand)]
+    dark = None
+    kept = []
+    for box in outer:
+        if dark is None:
+            dark = _dark(rgb)
+        if _tile_border(dark, box):
+            kept.append(box)
+    kept.sort()
+    return _best_row(kept, width)
 
-        if w > pad * 4 and h > pad * 4:
-            x += pad
-            y += pad
-            w -= pad * 2
-            h -= pad * 2
-        crop = _crop(raw, width, 4, x, y, w, h)
-        letters.append(_classify(crop, w, h, 4))
-    full = bool(row) and all(letters) and len(letters) == len(row)
-    prompt = "".join(letters) if full else ""
-    if not row:
-        full = True
-        prompt = ""
-    return {"prompt": prompt, "header": header, "tiles": len(row), "ms": 0, "full": full}
 
-def _best_row(tiles: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
-    best: list[tuple[int, int, int, int]] = []
+def _inside(inner: Box, outer: Box) -> bool:
+    cx, cy = inner[0] + inner[2] / 2, inner[1] + inner[3] / 2
+    return (outer[0] < cx < outer[0] + outer[2] and outer[1] < cy < outer[1] + outer[3]
+            and inner[2] * inner[3] < outer[2] * outer[3])
+
+
+def _tile_border(dark: np.ndarray, box: Box) -> bool:
+    x, y, w, h = box
+    height = dark.shape[0]
+    inset = max(2, w // 8)
+    inner = dark[y + inset:y + h - inset, x + inset:x + w - inset]
+    if inner.size and inner.mean() > 0.72:
+        return False
+    above = dark[max(0, y - 4):y, x:x + w]
+    below = dark[y + h:min(height, y + h + 4), x:x + w]
+    ring = np.concatenate([above.ravel(), below.ravel()])
+    return bool(ring.size) and ring.mean() >= 0.125
+
+
+def _best_row(tiles: List[Box], width: int) -> List[Box]:
+    best: List[Box] = []
     best_score = -1.0
     for i, (x, y, w, h) in enumerate(tiles):
         row = [(x, y, w, h)]
         last = x + w
         cy = y + h / 2
-        for nx, ny, nw, nh in tiles[i + 1 :]:
+        for nx, ny, nw, nh in tiles[i + 1:]:
             if abs((ny + nh / 2) - cy) > h / 2:
                 continue
             if abs(nh - h) > h / 2 or abs(nw - w) > w / 2:
@@ -491,8 +165,191 @@ def _best_row(tiles: list[tuple[int, int, int, int]]) -> list[tuple[int, int, in
                 break
             row.append((nx, ny, nw, nh))
             last = nx + nw
-        score = float(len(row) * len(row) * w * h)
+        centre = (row[0][0] + last) / 2
+        score = len(row) * len(row) * w * h * (1.15 - abs(centre - width / 2) / max(1, width))
         if score > best_score:
             best_score = score
             best = row
     return best
+
+
+_LETTER_CACHE: "OrderedDict[bytes, str]" = OrderedDict()
+
+
+def read_letter(rgb: np.ndarray, box: Box) -> str:
+    x, y, w, h = box
+    crop = rgb[y:y + h, x:x + w]
+    key = hashlib.blake2b(np.ascontiguousarray(crop[::2, ::2, 0] // 32).tobytes()
+                          + bytes((w & 255, h & 255)), digest_size=12).digest()
+    hit = _LETTER_CACHE.get(key)
+    if hit is not None:
+        _LETTER_CACHE.move_to_end(key)
+        return hit
+    letter = glyphs.read_tile(crop)
+    # Unread tiles are retried on the next frame rather than remembered.
+    if letter:
+        _LETTER_CACHE[key] = letter
+        if len(_LETTER_CACHE) > 160:
+            _LETTER_CACHE.popitem(last=False)
+    return letter
+
+
+# --- turn header ----------------------------------------------------------------
+
+def _grow(mask: np.ndarray, radius: int) -> np.ndarray:
+    out = mask.copy()
+    for _ in range(radius):
+        nxt = out.copy()
+        nxt[1:] |= out[:-1]
+        nxt[:-1] |= out[1:]
+        nxt[:, 1:] |= out[:, :-1]
+        nxt[:, :-1] |= out[:, 1:]
+        out = nxt
+    return out
+
+
+def header_glyphs(rgb: np.ndarray) -> List[Tuple[Box, Optional[np.ndarray], int]]:
+    """Header characters of the main text line: (box, feature, gap-before).
+
+    The game draws white letters with a dark outline, so each letter's white
+    fill is its own blob ringed by dark pixels; clouds and sky never are.
+    """
+    lines = header_lines(rgb)
+    return max(lines, key=len) if lines else []
+
+
+def header_lines(rgb: np.ndarray) -> List[List[Tuple[Box, Optional[np.ndarray], int]]]:
+    lo = rgb.min(axis=2)
+    hi = rgb.max(axis=2)
+    white = (lo > 170) & ((hi - lo) < 50)
+    dark = hi < 110
+    runs, labels, count = label_runs(white)
+    if not count:
+        return []
+    boxes = component_boxes(runs, labels, count)
+    height, width = white.shape
+    max_h = max(8, int(height * 0.6))
+    order = np.argsort(labels, kind="stable")
+    bounds = np.searchsorted(labels[order], np.arange(count + 1))
+    pieces = []
+    for index, (x0, y0, x1, y1, area) in enumerate(boxes.tolist()):
+        bw, bh = x1 - x0, y1 - y0
+        if area < 3 or bh > max_h or bh < 3 or bw > bh * 4 + 4:
+            continue
+        mask = _component_mask(runs[order[bounds[index]:bounds[index + 1]]], (x0, y0, x1, y1))
+        pad = 2
+        ex0, ey0 = max(0, x0 - pad), max(0, y0 - pad)
+        ex1, ey1 = min(width, x1 + pad), min(height, y1 + pad)
+        local = np.zeros((ey1 - ey0, ex1 - ex0), bool)
+        local[y0 - ey0:y1 - ey0, x0 - ex0:x1 - ex0] = mask
+        ring = _grow(local, 2) & ~local
+        # 0.45 keeps thin stems (the l in "english" rings at ~0.54) and still
+        # rejects clouds, whose white never sits inside a dark outline.
+        if not ring.any() or dark[ey0:ey1, ex0:ex1][ring].mean() < 0.45:
+            continue
+        pieces.append([x0, y0, x1, y1, mask])
+    return [_line_glyphs(line) for line in _group_lines(pieces)]
+
+
+def _group_lines(pieces: list) -> list:
+    # Full-size letters define each line; dots and punctuation then join it.
+    pieces.sort(key=lambda p: p[3] - p[1], reverse=True)
+    lines: list = []
+    for piece in pieces:
+        cy = (piece[1] + piece[3]) / 2
+        for line in lines:
+            reach = (line["y1"] - line["y0"]) * 0.35
+            if line["y0"] - reach <= cy <= line["y1"] + reach:
+                line["items"].append(piece)
+                break
+        else:
+            lines.append({"y0": piece[1], "y1": piece[3], "items": [piece]})
+    out = [line["items"] for line in lines if len(line["items"]) >= 6]
+    out.sort(key=lambda items: min(p[1] for p in items))
+    return out
+
+
+def _line_glyphs(items: list) -> List[Tuple[Box, Optional[np.ndarray], int]]:
+    items.sort(key=lambda p: p[0])
+    merged: list = []
+    for piece in items:
+        if merged:
+            prev = merged[-1]
+            overlap = min(piece[2], prev[2]) - max(piece[0], prev[0])
+            if overlap >= min(piece[2] - piece[0], prev[2] - prev[0]) * 0.5:
+                x0, y0 = min(prev[0], piece[0]), min(prev[1], piece[1])
+                x1, y1 = max(prev[2], piece[2]), max(prev[3], piece[3])
+                mask = np.zeros((y1 - y0, x1 - x0), bool)
+                for p in (prev, piece):
+                    mask[p[1] - y0:p[3] - y0, p[0] - x0:p[2] - x0] |= p[4]
+                merged[-1] = [x0, y0, x1, y1, mask]
+                continue
+        merged.append(piece)
+    areas = sorted(int(p[4].sum()) for p in merged)
+    typical = areas[len(areas) // 2] if areas else 0
+    body = [p for p in merged if p[4].sum() >= typical * 0.25] or merged
+    top = min(p[1] for p in body)
+    bottom = max(p[3] for p in body)
+    line_h = max(1, bottom - top)
+    out = []
+    last = None
+    for x0, y0, x1, y1, mask in merged:
+        gap = 0 if last is None else x0 - last
+        last = x1
+        out.append(((x0, y0, x1 - x0, y1 - y0), glyphs.head_feature(mask, y0 - top, line_h), gap * 100 // line_h))
+    return out
+
+
+def read_header(rgb: np.ndarray) -> str:
+    """Text of each outlined header line, joined with " | "."""
+    t = glyphs.templates()
+    texts = []
+    for line in header_lines(rgb):
+        chars = []
+        for index, (_box, feature, gap) in enumerate(line):
+            char, score = t.classify_head(feature)
+            if index and gap >= 19:
+                chars.append(" ")
+            chars.append(char if score >= glyphs.HEAD_MIN_SCORE else "?")
+        texts.append("".join(chars).strip())
+    return " | ".join(text for text in texts if text)
+
+
+def header_band(rgb: np.ndarray) -> np.ndarray:
+    height = rgb.shape[0]
+    return rgb[: max(8, int(height * 0.16))]
+
+
+_HEADER_KEY: Optional[bytes] = None
+_HEADER_TEXT = ""
+
+
+def header_text(rgb: np.ndarray) -> str:
+    """Cached by the outlined-text pixels only, so a moving sky never re-reads."""
+    global _HEADER_KEY, _HEADER_TEXT
+    band = header_band(rgb)
+    small = band[::2, ::2]
+    lo = small.min(axis=2)
+    hi = small.max(axis=2)
+    text_px = (lo > 170) & ((hi - lo) < 50) & _grow(hi < 110, 2)
+    key = hashlib.blake2b(np.packbits(text_px).tobytes(), digest_size=16).digest()
+    if key != _HEADER_KEY:
+        _HEADER_KEY = key
+        _HEADER_TEXT = read_header(band) if text_px.sum() >= 20 else ""
+    return _HEADER_TEXT
+
+
+def frame_array(raw, width: int, height: int) -> np.ndarray:
+    return np.frombuffer(raw, np.uint8, count=width * height * 4).reshape(height, width, 4)[..., :3]
+
+
+def scan_rgba(raw, width: int, height: int, name: str = "") -> dict:
+    if width < 8 or height < 8 or len(raw) < width * height * 4:
+        return {"prompt": "", "header": "", "tiles": 0, "ms": 0, "full": False}
+    rgb = frame_array(raw, width, height)
+    header = header_text(rgb)
+    row = find_tiles(rgb)
+    letters = [read_letter(rgb, box) or "?" for box in row]
+    prompt = "".join(letters)
+    return {"prompt": prompt, "header": header, "tiles": len(row), "ms": 0,
+            "full": "?" not in prompt}

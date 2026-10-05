@@ -2,6 +2,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
 #import <stdlib.h>
+#import <math.h>
 
 static CGImageRef (*ll_capture)(CGRect, uint32_t, uint32_t, uint32_t) = NULL;
 
@@ -19,7 +20,10 @@ static int roblox_window(void) {
         CFDictionaryRef d = CFArrayGetValueAtIndex(info, i);
         CFStringRef owner = CFDictionaryGetValue(d, kCGWindowOwnerName);
         if (!owner) continue;
-        if (CFStringFind(owner, CFSTR("Roblox"), kCFCompareCaseInsensitive).location == kCFNotFound) continue;
+        BOOL player = CFStringCompare(owner, CFSTR("Roblox"), kCFCompareCaseInsensitive) == kCFCompareEqualTo
+                   || CFStringCompare(owner, CFSTR("RobloxPlayer"), kCFCompareCaseInsensitive) == kCFCompareEqualTo
+                   || CFStringCompare(owner, CFSTR("RobloxPlayerBeta"), kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+        if (!player) continue;
         int layer = 0, wid = 0;
         CFNumberGetValue(CFDictionaryGetValue(d, kCGWindowLayer), kCFNumberIntType, &layer);
         CFNumberGetValue(CFDictionaryGetValue(d, kCGWindowNumber), kCFNumberIntType, &wid);
@@ -66,41 +70,25 @@ int ll_grab(unsigned char **out, int *w, int *h) {
         CGImageRelease(img);
         return 0;
     }
+    // Resize directly into a bounded capture buffer, instead of allocating
+    // the full Retina screen and discarding every second/third pixel.
+    double factor = fmax(1.0, fmax((double)W / 1600.0, (double)H / 1600.0));
+    W = (size_t)((double)W / factor);
+    H = (size_t)((double)H / factor);
     unsigned char *buf = calloc(W * H, 4);
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, W, H, 8, W * 4, cs, kCGImageAlphaPremultipliedLast);
+    CGContextRef ctx = buf ? CGBitmapContextCreate(buf, W, H, 8, W * 4, cs, kCGImageAlphaPremultipliedLast) : NULL;
     CGColorSpaceRelease(cs);
-    if (!ctx || !buf) {
+    if (!ctx) {
         free(buf);
         CGImageRelease(img);
         return 0;
     }
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
     CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), img);
     CGContextRelease(ctx);
     CGImageRelease(img);
 
-    if (W > 1280) {
-        int factor = (int)((W + 1279) / 1280);
-        if (factor < 2) factor = 2;
-        int tw = (int)W / factor;
-        int th = (int)H / factor;
-        if (tw >= 200 && th >= 200) {
-            unsigned char *small = malloc((size_t)tw * th * 4);
-            if (small) {
-                for (int y = 0; y < th; y++) {
-                    const unsigned char *row = buf + (size_t)y * factor * W * 4;
-                    unsigned char *dst = small + (size_t)y * tw * 4;
-                    for (int x = 0; x < tw; x++) {
-                        memcpy(dst + (size_t)x * 4, row + (size_t)x * factor * 4, 4);
-                    }
-                }
-                free(buf);
-                buf = small;
-                W = (size_t)tw;
-                H = (size_t)th;
-            }
-        }
-    }
     *out = buf;
     *w = (int)W;
     *h = (int)H;
