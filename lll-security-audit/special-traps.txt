@@ -1,0 +1,50 @@
+(if possivle) e'	2	k'iche' - e'en e'er
+i'	6	bakati' ch'orti' q'eqchi' - i'd i'd've i'll i'm i's i've
+b-i	1	sub-i - b-ideal
+d-o	1	good-o - d-optimal
+i'l	1	li'l - i'll
+i'd	2	i'd isekai'd - i'd i'd've
+l-c	2	bicaudal-c - l-cell l-cells
+l-d	2	bicaudal-d - l-dopa l-dopas
+n-c	2	tenascin-c - n-chain n-chains
+p-p	2	fenoxaprop-p fluazifop-p - p-phenylenediamine p-phenylenediamines
+t-i	2	mscarlet-i - t-intersection t-intersections
+y-a	2	gray-a grey-a - y-axes y-axis
+l-a	3	abdominal-a - l-acetylcarnitine l-asparagine l-asparagines
+t-o	3	right-o - t-octylphenoxypolyethoxyethanol t-octylphenoxypolyethoxyethanols t-optimal
+e-k	4	ace-k pre-k - e-kid e-kids e-kitten e-kittens
+he'	4	k'iche' - he'd he'd've he'll he's
+n-r	6	tenascin-r - n-ras n-rases n-ray n-rays n-retinylidene-n-retinylethanolamine n-retinylidene-n-retinylethanolamines
+l-m	8	metalaxyl-m - l-meth l-methamphetamine l-methamphetamines l-meths l-moment l-moments l-myc l-mycs
+n-d	8	jun-d - n-desmethylclozapine n-desmethylclozapines n-desmethyltamoxifen n-desmethyltamoxifens n-diethylnitrosamines n-dimensional n-dimensionalities n-dimensionality
+n-b	9	fetuin-b jun-b orexin-b - n-benzoyl-n-phenylhydroxylamine n-benzoyl-n-phenylhydroxylamines n-benzylidenebenzylamine n-benzylidenebenzylamines n-butyl n-butylamine n-butylamines n-butyldeoxynojirimycin n-butyls
+e-m	13	oxotremorine-m - e-mail e-mailed e-mailer e-mailers e-mailing e-mails e-marketing e-marketings e-marketplace e-marketplaces e-money e-moneys
+n-a	62	anatoxin-a fetuin-a homoanatoxin-a orexin-a - n-acetyl-aspartyl-glutamate n-acetyl-aspartyl-glutamates n-acetyl-beta-d-glucosaminidase n-acetyl-beta-d-glucosaminidases n-acetyl-d-alanine n-acetyl-d-alanines n-acetyl-d-galactosamine n-acetyl-d-galactosamines n-acetyl-d-glucosamine n-acetyl-d-glucosamines n-acetyl-d-mannosamine n-acetyl-d-mannosamines
+d-be	1	would-be - d-beat
+e-in	1	cave-in close-in dine-in drive-in fade-in tie-in trade-in write-in - e-infrastructure
+g-ho	1	gung-ho - g-house
+t-op	1	post-op - t-optimal
+a-la	2	ooh-la-la - a-law a-laws
+a-ok	2	a-ok - a-ok a-okay
+d-so	2	so-and-so - d-sorbitol d-sorbitols
+do'a	2	do'a - do'a do'as
+e-he	2	he-he - e-health e-healths
+he'd	2	he-he'd he'd she'd - he'd he'd've
+l-as	2	abdominal-as - l-asparagine l-asparagines
+o-mo	2	slo-mo - o-module o-modules
+pa'o	2	pa'o - pa'o pa'os
+t-in	2	built-in cut-in shut-in sit-in - t-intersection t-intersections
+u-ey	2	u-ey - u-ey u-eys
+u-ie	2	u-ie - u-ie u-ies
+we'd	2	we'd - we'd we'd've
+y-in	2	buy-in - y-intercept y-intercepts
+e-ho	3	yo-heave-ho - e-hon e-hookah e-hookahs
+k-in	3	break-in check-in lock-in pre-check-in self-check-in - k-indie k-invariant k-invariants
+ch'i	4	ch'i - ch'i ch'i-p'ao ch'i-p'aos ch'is
+e-se	4	felo-de-se felones-de-se felos-de-se - e-securities e-security e-sex e-sexes
+in-b	4	fetuin-b orexin-b - in-between in-betweener in-betweeners in-betweens
+o-to	4	go-to juzen-taiho-to shakuyaku-kanzo-to sho-saiko-to - o-tolualdehyde o-tolualdehydes o-toluidine o-toluidines
+e-da	5	la-de-da - e-dated e-dater e-daters e-dating e-datings
+in-a	5	anatoxin-a fetuin-a homoanatoxin-a orexin-a - in-and-in in-and-out in-and-outer in-and-outers in-and-outs
+o-be	6	abilities-to-be ability-to-be coming-to-be comings-to-be groom-to-be grooms-to-be ought-to-be want-to-be - o-be-joyful o-be-joyfuls o-benzoquinone o-benzoquinones o-benzylhydroxylamine o-benzylhydroxylamines
+s-me	6	jack-jump-up-and-kiss-me kiss-me - s-mercaptocysteine s-mercaptocysteines s-methylcysteine s-methylcysteines s-methylmethionine s-methylmethionines
