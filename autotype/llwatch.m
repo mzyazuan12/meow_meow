@@ -10,11 +10,6 @@
 #import <string.h>
 #import <unistd.h>
 
-// Reads the Last Letter board from the Roblox window.
-// Letter tiles are matched against fonts locally, so a frame stays fast
-// and a single tile still resolves. Vision is only used for the turn line,
-// and only when that line's pixels actually change.
-
 static CGImageRef (*ll_capture)(CGRect, uint32_t, uint32_t, uint32_t) = NULL;
 
 static const int GRID = 24;
@@ -57,7 +52,7 @@ static CGImageRef capture(int wid) {
 }
 
 static int dark_px(const unsigned char *p) {
-    // Anti-aliased edges sit above a hard black. Counting them keeps thin letters.
+
     return p[0] < 150 && p[1] < 150 && p[2] < 150;
 }
 
@@ -209,9 +204,6 @@ static char classify(const unsigned char *buf, int w, int h, float *outScore, fl
     return (char)('a' + bestI);
 }
 
-// One request for the whole process. A new VNRecognizeTextRequest per tile
-// reloads the text model and keeps every previous one, which is what grew
-// the reader into hundreds of gigabytes.
 static VNRecognizeTextRequest *shared_ocr_request(void) {
     static VNRecognizeTextRequest *req = nil;
     if (!req) {
@@ -334,8 +326,7 @@ static void one_frame(int wid) {
 }
 
 static CGImageRef image_from_buffer(const unsigned char *buf, size_t W, size_t H) {
-    // Copy into an image we own. The old provider pointed at the frame buffer,
-    // and Vision kept that buffer after the frame was freed.
+
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(NULL, W, H, 8, W * 4, cs, kCGImageAlphaPremultipliedLast);
     CGColorSpaceRelease(cs);
@@ -350,8 +341,7 @@ static CGImageRef image_from_buffer(const unsigned char *buf, size_t W, size_t H
 static int g_tile_ocr_left = 0;
 
 static unsigned long hash_tile(const unsigned char *buf, size_t W, Box box) {
-    // Ink or no ink. Raw pixel bytes flicker every frame and were forcing a
-    // fresh text scan of every letter, which is the memory leak.
+
     unsigned long hash = 1469598103934665603UL;
     hash ^= (unsigned long)box.w;
     hash *= 1099511628211UL;
@@ -370,11 +360,10 @@ static unsigned long hash_tile(const unsigned char *buf, size_t W, Box box) {
 static char looks_like_i(const unsigned char *buf, size_t W, size_t H, Box box);
 
 static char ocr_one_tile(const unsigned char *buf, size_t W, size_t H, Box box) {
-    // A new word is a handful of scans, then the tile cache takes over.
-    // Scanning every letter of every frame is what exhausted RAM.
+
     if (g_tile_ocr_left <= 0) return 0;
     g_tile_ocr_left--;
-    // Keep the whole glyph. A deep crop clips M and W and the letter is dropped.
+
     int inset = box.w / 12;
     if (inset < 1) inset = 1;
     int sw = box.w - inset * 2;
@@ -419,7 +408,6 @@ static char ocr_one_tile(const unsigned char *buf, size_t W, size_t H, Box box) 
     return looks_like_i(buf, W, H, box) ? 'i' : 0;
 }
 
-// A capital I is a narrow bar down the middle of the tile. Vision often skips it.
 static char looks_like_i(const unsigned char *buf, size_t W, size_t H, Box box) {
     int inset = box.w / 7;
     if (inset < 1) inset = 1;
@@ -447,9 +435,6 @@ static char looks_like_i(const unsigned char *buf, size_t W, size_t H, Box box) 
     return 1;
 }
 
-// A round o is centered along its bottom edge. q puts a tail or a descender
-// there, so those pixels sit to the right. Template scores treat the two bowls
-// as the same letter, so this runs even when the score is high.
 static char settle_qo(const unsigned char *buf, int w, int h, char guess) {
     if (guess != 'o' && guess != 'q') return guess;
     if (w < 8 || h < 8) return guess;
@@ -515,7 +500,7 @@ static char read_letter(const unsigned char *buf, size_t W, size_t H, Box box) {
         return shaped;
     }
     free(tile);
-    // A near-perfect template hit can skip OCR. Anything less was calling Y a W.
+
     if (shaped && score >= 0.94f && margin >= 0.08f) return shaped;
     char seen = ocr_one_tile(buf, W, H, box);
     if (seen) return seen;
@@ -543,7 +528,7 @@ static NSString *read_tiles(const unsigned char *buf, size_t W, size_t H, Box *r
         }
         if (!known) {
             ch = read_letter(buf, W, H, row[i]);
-            // Don't remember a miss. A blurred frame was getting stuck as the letter.
+
             if (ch) {
                 if (seenCount < SEEN_CAP) {
                     seenHash[seenCount] = hash;
@@ -556,7 +541,7 @@ static NSString *read_tiles(const unsigned char *buf, size_t W, size_t H, Box *r
                 }
             }
         }
-        // A missed tile is not a shorter word. The caller keeps the last complete read.
+
         if (!ch) return @"";
         [letters appendFormat:@"%c", ch];
     }
@@ -601,7 +586,7 @@ static int message_ink(const unsigned char *p) {
     if (b > mx) mx = b;
     int mn = r < g ? r : g;
     if (b < mn) mn = b;
-    // White letters, or a colored refusal line such as red "already used".
+
     return mx > 175 && (mn > 165 || mx - mn > 50);
 }
 
@@ -645,7 +630,6 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
     }
     size_t bpr = W * 4;
 
-    // The turn line is the white banner under the window chrome. Chat sits lower.
     int headY = (int)(H * 0.012);
     int headH = (int)(H * 0.145);
     if (headY + headH > (int)H) headH = (int)H - headY;
@@ -654,8 +638,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
     static unsigned long cachedHeadHash = 0;
     unsigned long headHash = hash_bytes(buf + (size_t)headY * bpr, (int)W, headH, 6);
     NSString *header = cachedHeader ?: @"";
-    // The 3D view makes this band change every frame. OCR at most a few times
-    // a second, and keep the last turn line in between.
+
     static CFAbsoluteTime lastHeaderOcr = 0;
     CFAbsoluteTime headerNow = CFAbsoluteTimeGetCurrent();
     if ((headHash != cachedHeadHash || !cachedHeader) && headerNow - lastHeaderOcr > 0.45) {
@@ -663,7 +646,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
         unsigned char *bandBuf = malloc((size_t)headH * bpr);
         if (bandBuf) {
             memcpy(bandBuf, buf + (size_t)headY * bpr, (size_t)headH * bpr);
-            // White banner letters become black on white so the outline does not confuse OCR.
+
             for (size_t i = 0; i < (size_t)headH * W; i++) {
                 unsigned char *p = bandBuf + i * 4;
                 if (p[0] > 210 && p[1] > 210 && p[2] > 210) {
@@ -683,7 +666,6 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
         cachedHeader = [header copy];
     }
 
-    // The word can sit anywhere on the key screen, not only in a thin top band.
     int y0 = (int)(H * 0.04);
     int y1 = (int)(H * 0.74);
     if (y1 > (int)H) y1 = (int)H;
@@ -759,7 +741,6 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
         }
     }
 
-    // The counter of O, D, A, P, Q, R, B is its own white blob. Drop blobs inside a tile.
     int keep[240];
     int nkeep = 0;
     for (int i = 0; i < nboxes; i++) {
@@ -797,7 +778,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
             count++;
             last = j;
         }
-        // A row of letter tiles beats one big speech bubble.
+
         double score = (double)count * count * kept[i].h * kept[i].w;
         double cx = (kept[i].x + kept[last].x + kept[last].w) / 2.0;
         double off = fabs(cx - (double)W / 2.0) / (double)W;
@@ -816,7 +797,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
         for (int j = bestI; j <= bestJ && nrow < 64; j++) {
             int dy = abs((kept[j].y + kept[j].h / 2) - (kept[bestI].y + kept[bestI].h / 2));
             if (dy > kept[bestI].h / 2) continue;
-            // A tile carries a dark letter. Empty white squares are chrome.
+
             int ink = 0, tot = 0;
             int inset = kept[j].w / 8;
             if (inset < 2) inset = 2;
@@ -828,10 +809,9 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
                 }
             }
             double ratio = tot ? (double)ink / (double)tot : 0;
-            // I and L are thin. A higher floor drops the I in a prompt like "id".
+
             if (ratio < 0.012 || ratio > 0.72) continue;
-            // Black stroke just outside the white fill. Sample a few pixels out
-            // so a thin stroke still counts and the sky behind it does not.
+
             int border = 0, samples = 0;
             int step = kept[j].w / 6;
             if (step < 2) step = 2;
@@ -876,7 +856,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
             prompt = letters;
             full = 1;
         } else {
-            // A dropped letter would store a different word. Keep the previous complete read.
+
             prompt = @"";
             full = 0;
         }

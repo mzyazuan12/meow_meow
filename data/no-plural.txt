@@ -1,8 +1,3 @@
-# Trap prefixes from traps-no-dyoe-solves.txt excluding plural-solvable traps
-# Source: no non-self solve word in dyoe.txt
-# Rule: exclude if any listed solve is exactly prefix+"s" or prefix+"es"
-# source=1213 excluded_plural=470 kept=743
-# Blacklisted prefixes already excluded
 
 bz	1	dyoe_giveable=yes	bz	1	pesh-kabz - bzzt
 fg	1	dyoe_giveable=yes	fg	1	lfg omfg - fgn

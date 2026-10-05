@@ -293,8 +293,6 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     [self layoutForSpam:spam];
 }
 
-// The trap box sits between the mode buttons and the phase line. The card and
-// the log move down while it is open so the phase line cannot cover the field.
 - (void)layoutForSpam:(BOOL)spam {
     self.spamCaption.hidden = !spam;
     self.spamField.hidden = !spam;

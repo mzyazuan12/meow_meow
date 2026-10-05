@@ -1,5 +1,3 @@
-# prefixes with 3-4 real solve groups (plural s/es ignored); n=5399
-# PREFIX\treal_groups\treal_solves\traw_groups\tignored_plural_keys
 bt	3	3	4	s
 bw	3	11	3	-
 fc	3	5	3	-

@@ -1,5 +1,3 @@
-"""Checks for Featherine timing and the DYOE round clock."""
-
 from __future__ import annotations
 
 import random
@@ -20,7 +18,6 @@ from autotype.session import (
     speaker_from_header,
     sync_round_to_prefix,
 )
-
 
 class PhaseTests(unittest.TestCase):
     def test_phase_every_five_rounds(self) -> None:
@@ -45,7 +42,6 @@ class PhaseTests(unittest.TestCase):
         self.assertIsNone(finished_word("men", "menstrua"))
         self.assertEqual(finished_word("menstrual", "l"), "menstrual")
         self.assertIsNone(finished_word("m", "m"))
-
 
 class BoardWatchTests(unittest.TestCase):
     def test_our_turn_plays_the_prefix_once_it_has_settled(self) -> None:
@@ -79,7 +75,7 @@ class BoardWatchTests(unittest.TestCase):
         watch.observe("sk", "ours", now=0.0)
         self.assertEqual(watch.observe("sk", "ours", now=0.8)["play"], "sk")
         watch.played = "sk"
-        # The banner still says us while their prefix is spawning.
+
         self.assertEqual(watch.observe("w", "ours", now=1.0)["play"], "")
         self.assertEqual(watch.observe("wow", "ours", now=1.4)["play"], "")
         self.assertEqual(watch.observe("wow", "ours", now=2.4)["play"], "")
@@ -134,7 +130,6 @@ class BoardWatchTests(unittest.TestCase):
         self.assertTrue(accepted["accepted"])
         self.assertEqual(accepted["play"], "")
         self.assertEqual(accepted["candidates"], [])
-
 
 class FeatherineTests(unittest.TestCase):
     def test_featherine_uses_the_human_plan_at_her_tempo(self) -> None:
@@ -222,7 +217,6 @@ class FeatherineTests(unittest.TestCase):
         self.assertTrue(word.endswith("ne"))
         self.assertEqual(suffix, word[2:])
 
-
 class HumanTypingTests(unittest.TestCase):
     def test_the_first_key_has_no_lead_in(self) -> None:
         plan = human_plan("stone", "guga2323332", rng=random.Random(2).random)
@@ -265,7 +259,6 @@ class HumanTypingTests(unittest.TestCase):
         self.assertGreater(corrections, 0)
         self.assertLess(corrections, len(plans))
 
-
 def _glyph(width: int, height: int, oval: bool, tail: bool) -> bytes:
     raw = bytearray([255]) * (width * height * 3)
     cx, cy = width / 2, height * 0.42
@@ -292,14 +285,12 @@ def _glyph(width: int, height: int, oval: bool, tail: bool) -> bytes:
                 paint(x + dx, y)
     return bytes(raw)
 
-
 class LetterShapeTests(unittest.TestCase):
     def test_q_tail_is_not_read_as_o(self) -> None:
         bowl = _glyph(96, 120, oval=True, tail=False)
         tailed = _glyph(96, 120, oval=True, tail=True)
         self.assertEqual(settle_qo(bowl, 96, 120, 3, "q"), "o")
         self.assertEqual(settle_qo(tailed, 96, 120, 3, "o"), "q")
-
 
 if __name__ == "__main__":
     unittest.main()

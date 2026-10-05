@@ -1,5 +1,3 @@
-"""Last Letter autotype. Reads the live tiles, picks with DYOE, types the ending."""
-
 from __future__ import annotations
 
 import os
@@ -48,12 +46,9 @@ MUTED = "#98958b"
 CARD = "#11110f"
 LINE = "#2c2c28"
 
-
 PANEL_BIN = _ROOT / "autotype" / "llpanel"
 
-
 class NativeFace:
-    """AppKit panel. The system Tk window draws blank on this Mac."""
 
     def __init__(self, proc: subprocess.Popen) -> None:
         self.proc = proc
@@ -75,14 +70,12 @@ class NativeFace:
         if self.proc.poll() is None:
             self.proc.kill()
 
-
 def _mono() -> str:
     if sys.platform == "darwin":
         return "Menlo"
     if sys.platform == "win32":
         return "Consolas"
     return "DejaVu Sans Mono"
-
 
 class AutotypeApp:
     def __init__(self, root: tk.Tk | None = None, *, face: NativeFace | None = None) -> None:
@@ -161,8 +154,7 @@ class AutotypeApp:
             pass
         mono = _mono()
         win.option_add("*Font", f"{mono} 12")
-        # Paint into a frame. Setting the window background on Apple's Tk 8.5
-        # leaves the whole panel blank, which is the empty gray window.
+
         root = tk.Frame(win, bg=INK, highlightthickness=0)
         root.pack(fill="both", expand=True)
 
@@ -293,7 +285,7 @@ class AutotypeApp:
         if self.face is not None:
             self._handle_frame(frame)
             return
-        # Keep a single pending frame so a stuck window cannot pile up grabs.
+
         while self._queue.qsize() > 2:
             try:
                 self._queue.get_nowait()
@@ -622,7 +614,7 @@ class AutotypeApp:
         threading.Thread(target=self._type_suffix, args=(gen, word, suffix), daemon=True).start()
 
     def _schedule_retry(self, word: str, *, used: bool) -> None:
-        """Backspace the word the game refused, then play a different one."""
+
         if not word or self._erasing or word == self._retried:
             return
         suffix = self._typed_suffix
@@ -785,9 +777,8 @@ class AutotypeApp:
         if self.root is not None:
             self.root.destroy()
 
-
 def _reveal(root: tk.Tk) -> None:
-    """Apple's Tk 8.5 draws an empty window until it is hidden and shown once."""
+
     if sys.platform != "darwin":
         return
     try:
@@ -801,7 +792,6 @@ def _reveal(root: tk.Tk) -> None:
             root.after(40, lambda: root.geometry(f"{width}x{height}"))
     except tk.TclError:
         return
-
 
 def main() -> None:
     if sys.platform == "darwin" and PANEL_BIN.is_file():
@@ -833,7 +823,6 @@ def main() -> None:
     AutotypeApp(root)
     root.after(0, lambda: _reveal(root))
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

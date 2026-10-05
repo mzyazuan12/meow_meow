@@ -1,10 +1,3 @@
-"""Round clock and DYOE picks for Last Letter.
-
-Prefix length climbs every 5 of your rounds, capped at 4:
-round 1–5 phase 1, 6–10 phase 2, 11–15 phase 3, 16+ phase 4.
-A longer prefix already on the board jumps the phase up to match.
-"""
-
 from __future__ import annotations
 
 import re
@@ -20,20 +13,17 @@ _TURN_RE = re.compile(
     re.I,
 )
 
-
 def phase_for_round(round_n: int) -> int:
     n = max(1, int(round_n or 1))
     return min(4, 1 + (n - 1) // ROUNDS_PER_PHASE)
-
 
 def phase_for_prompt(round_n: int, prefix: str) -> int:
     length = len(prefix or "")
     by_len = 1 if length <= 1 else min(4, length)
     return max(phase_for_round(round_n), by_len)
 
-
 def sync_round_to_prefix(round_n: int, prefix: str) -> int:
-    """Bump the round counter when the board is already in a later phase."""
+
     need = 1 if len(prefix) <= 1 else min(4, len(prefix))
     round_n = max(1, int(round_n or 1))
     guard = 0
@@ -41,7 +31,6 @@ def sync_round_to_prefix(round_n: int, prefix: str) -> int:
         round_n += ROUNDS_PER_PHASE
         guard += 1
     return round_n
-
 
 def _shared_run(a: str, b: str) -> int:
     best = 0
@@ -52,7 +41,6 @@ def _shared_run(a: str, b: str) -> int:
         best = max(best, size)
     return 0
 
-
 def names_match(ours: str, seen: str) -> bool:
     a = re.sub(r"[^a-z0-9]", "", (ours or "").lower())
     b = re.sub(r"[^a-z0-9]", "", (seen or "").lower())
@@ -60,7 +48,7 @@ def names_match(ours: str, seen: str) -> bool:
         return False
     if a == b or a in b or b in a:
         return True
-    # The tile header OCR often drops or swaps the first letter.
+
     if len(a) >= 6 and a[-6:] == b[-6:]:
         return True
     digits_a = re.sub(r"\D", "", a)
@@ -69,9 +57,8 @@ def names_match(ours: str, seen: str) -> bool:
         return True
     letters_a = re.sub(r"[^a-z]", "", a)
     letters_b = re.sub(r"[^a-z]", "", b)
-    # "gugugaga2323332" is read as "uyugaga23233312": one dropped letter, one extra digit.
-    return _shared_run(digits_a, digits_b) >= 5 and _shared_run(letters_a, letters_b) >= 5
 
+    return _shared_run(digits_a, digits_b) >= 5 and _shared_run(letters_a, letters_b) >= 5
 
 def speaker_from_header(header: str) -> str:
     text = header or ""
@@ -80,14 +67,13 @@ def speaker_from_header(header: str) -> str:
         return match.group(1)
     if "starting with" not in text.lower() and "english word" not in text.lower():
         return ""
-    # OCR sometimes drops the comma. Take the token before "type".
+
     head = re.split(r"type an english", text, flags=re.I)[0]
     tokens = [token for token in _NAME_RE.findall(head) if len(token) >= 4]
     return tokens[-1] if tokens else ""
 
-
 def header_is_ours(name: str, header: str) -> bool:
-    """True when this turn line is addressed to us, even if OCR mangles the name."""
+
     if not header_is_turn(header):
         return False
     speaker = speaker_from_header(header)
@@ -100,37 +86,22 @@ def header_is_ours(name: str, header: str) -> bool:
         return True
     return len(digits) >= 4 and digits in compact
 
-
 def already_used_text(text: str) -> bool:
-    """The line under the tiles when the game refuses a word that was played before."""
+
     low = re.sub(r"[^a-z]+", " ", (text or "").lower())
     return "already" in low and "used" in low
-
 
 def header_is_turn(header: str) -> bool:
     low = (header or "").lower()
     return "english word" in low or "starting with" in low
 
-
-# Tiles spawn one letter at a time. A short row has to sit still before it is
-# the whole prefix. Four letters cannot grow any further, so that row settles faster.
 _PREFIX_SETTLE = 0.72
 _PREFIX_SETTLE_FULL = 0.24
 _OURS_HEADER = 0.22
-# Their prefix can still be on screen when the banner flips back to us.
+
 _SAME_PROMPT = 0.95
 
-
 class BoardWatch:
-    """Turn the live tile string into a prompt to type and a word to store.
-
-    The board grows while someone types, then collapses to the next prefix
-    when the word is accepted. The first complete reading is kept, so a word
-    that is only on screen for one frame is still stored in full.
-
-    A prefix is typed only after the row stops gaining letters and the turn
-    line has stayed ours. Their prompt is not typed when the banner is late.
-    """
 
     def __init__(self) -> None:
         self.turn = ""
@@ -176,7 +147,7 @@ class BoardWatch:
         self._last_reads = []
 
     def rearm(self, prompt: str, now: float) -> None:
-        """The last word was refused. Type another one for the same prefix."""
+
         prompt = self._prompt(prompt)
         self.played = ""
         self.typed = ""
@@ -217,7 +188,7 @@ class BoardWatch:
         self._last_reads = [word for word in self._memory if len(word) >= 4]
 
     def _candidates(self, prefix: str) -> list[str]:
-        """Every reading from this turn that actually ends with the new prefix."""
+
         if not prefix:
             return []
         out: list[str] = []
@@ -254,7 +225,7 @@ class BoardWatch:
             self._saw_theirs = True
 
     def _arm_play(self, out: dict, prompt: str, whose: str, now: float) -> None:
-        """Type `prompt` only when it has stopped growing and the turn is ours."""
+
         prompt = self._prompt(prompt)
         if whose == "theirs":
             self._saw_theirs = True
@@ -310,7 +281,7 @@ class BoardWatch:
         else:
             self._clock = now
         if not complete:
-            # A tile is on screen that we have not read yet. The prefix is still loading.
+
             if tiles and self._hold and tiles > len(self._hold):
                 self._hold_at = now
             board = ""
@@ -325,7 +296,6 @@ class BoardWatch:
             out["partials"] = list(self._last_reads)
             return out
 
-        # Letters still sitting in the box after a refused word are not a new prompt.
         if self._retry_prompt:
             if board == self._retry_prompt:
                 self._retry_prompt = ""
@@ -335,7 +305,6 @@ class BoardWatch:
                 self.turn = "ours"
                 return out
 
-        # A word longer than a prefix is theirs, even when the last tiles were cut off.
         if (
             len(board) >= 4
             and not self.typed
@@ -345,7 +314,6 @@ class BoardWatch:
             self._remember(board)
         out["partials"] = list(self._last_reads)
 
-        # Our word is in. Store it once the tiles become its ending, or their turn starts.
         if self.typed:
             still_ours = board.startswith(self.pending) and len(board) >= len(self.pending) and whose != "theirs"
             if still_ours and not (len(board) <= 4 and board != self.played and self.typed.endswith(board)):
@@ -407,7 +375,6 @@ class BoardWatch:
 
         self._reject_hits = 0
 
-        # Letters added onto the prefix we just played are our word, not a new prompt.
         if self.played and whose != "theirs" and self.turn != "theirs" and board.startswith(self.played):
             if len(board) >= len(self.pending):
                 self.pending = board
@@ -482,7 +449,6 @@ class BoardWatch:
             out["turn"] = self.turn
             return out
 
-        # The whole word showed up in one frame. Keep it immediately.
         if len(board) > 4 and whose != "ours":
             self.pending = board
             self.turn = "theirs"
@@ -521,7 +487,6 @@ class BoardWatch:
             out["turn"] = "theirs"
             return out
 
-        # One odd frame cannot erase the word already on the board.
         if board == self._alt:
             self.pending = board
             self.turn = whose or self.turn
@@ -557,14 +522,8 @@ class BoardWatch:
             return True
         return any(self._is_submit(word, board) for word in self._memory)
 
-
 def finished_word(previous: str, current: str) -> Optional[str]:
-    """A played word, once the tiles stop extending it.
 
-    Growing tiles mean someone is still typing. A shorter board that the
-    previous word ends with is the next prefix, so the previous string was
-    the word they submitted.
-    """
     prev = (previous or "").lower()
     cur = (current or "").lower()
     if len(prev) < 2 or prev == cur or cur.startswith(prev):
@@ -574,7 +533,6 @@ def finished_word(previous: str, current: str) -> Optional[str]:
     if len(prev) > len(cur) + 1:
         return prev
     return None
-
 
 class MatchSession:
     def __init__(self, engine: Dyoe2Engine) -> None:
@@ -596,7 +554,7 @@ class MatchSession:
         self.engine.set_casual_mode(casual)
 
     def set_mode(self, mode: str) -> None:
-        """casual, pro, or spam. Spam plays words that end with the typed prefixes."""
+
         mode = mode if mode in ("casual", "pro", "spam") else "casual"
         self.mode = mode
         self.casual = mode != "pro"
@@ -637,10 +595,7 @@ class MatchSession:
         return True
 
     def note_seen_words(self, words: list) -> str:
-        """Store the longest real word among the readings that ended the turn.
 
-        A shorter misread is ignored when the full word was also on screen.
-        """
         best = ""
         for word in words:
             cleaned = re.sub(r"[^a-z'\-]", "", (word or "").lower())
@@ -657,11 +612,7 @@ class MatchSession:
         return best
 
     def recover_partial(self, partials: list, ending: str) -> str:
-        """The tiles closed early. The new prompt is the ending they actually played.
 
-        `nesti` is not a word, and the next prompt is `ing`, so the word is the
-        dictionary entry that starts with that fragment and ends with `ing`.
-        """
         ending = re.sub(r"[^a-z]", "", (ending or "").lower())
         if not 1 <= len(ending) <= 4:
             return ""
@@ -703,7 +654,7 @@ class MatchSession:
         return ""
 
     def note_opponent_bridge(self, word: str, given: str, nxt: str) -> bool:
-        """Store the opponent's word only when it actually links the two prefixes."""
+
         cleaned = re.sub(r"[^a-z'\-]", "", (word or "").lower())
         given = (given or "").lower()
         nxt = (nxt or "").lower()
@@ -729,7 +680,7 @@ class MatchSession:
         return phase
 
     def choices(self, prefix: str, limit: int = 3) -> list:
-        """Top words the engine would play for this prefix, best first."""
+
         prefix = (prefix or "").strip().lower()
         self.prepare(prefix)
         if not prefix:
@@ -746,7 +697,7 @@ class MatchSession:
         return out
 
     def choose(self, prefix: str) -> Tuple[str, str, Optional[str], int]:
-        """Return word, suffix to type, trap, phase. Suffix excludes the prefix."""
+
         prefix = (prefix or "").strip().lower()
         phase = self.prepare(prefix)
         if not prefix:

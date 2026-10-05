@@ -1,10 +1,3 @@
-"""Read Last Letter tiles from a screen image.
-
-Used on Windows and Linux, and on macOS when the native reader is missing.
-A row is returned only when every tile has a letter, so a missed glyph cannot
-be stored as a shorter word.
-"""
-
 from __future__ import annotations
 
 import os
@@ -19,7 +12,6 @@ _TNORM: list[list[float]] = []
 _PHRASE = "type an english word"
 _TURN_MARK = "starting"
 _PHRASE_BITS: list[tuple[int, int, bytes]] = []
-
 
 def _font_files() -> list[Path]:
     found: list[Path] = []
@@ -51,7 +43,6 @@ def _font_files() -> list[Path]:
             ]
         )
     return [path for path in found if path.is_file()]
-
 
 def _density(raw: bytes, width: int, height: int, stride: int) -> list[float]:
     grid = [0.0] * CELLS
@@ -103,10 +94,8 @@ def _density(raw: bytes, width: int, height: int, stride: int) -> list[float]:
             grid[gy * GRID + gx] = (ink / tot) if tot else 0.0
     return grid
 
-
 def _norm(grid: list[float]) -> float:
     return sum(v * v for v in grid) ** 0.5
-
 
 def _ensure_templates() -> None:
     if _TEMPLATES:
@@ -147,7 +136,6 @@ def _ensure_templates() -> None:
             draw.text((4, 6), _PHRASE, fill=255, font=phrase_font)
             _PHRASE_BITS.append((420, 48, image.tobytes()))
 
-
 def _cosine(tile: list[float], tmpl: list[float], tnorm: float) -> float:
     dot = 0.0
     norm = 0.0
@@ -158,13 +146,8 @@ def _cosine(tile: list[float], tmpl: list[float], tnorm: float) -> float:
         return 0.0
     return dot / ((norm ** 0.5) * tnorm)
 
-
 def settle_qo(raw: bytes, width: int, height: int, stride: int, guess: str) -> str:
-    """Tell q from o by where the lowest ink sits.
 
-    A round o is centered on its bottom. A q carries a tail or a descender,
-    so the lowest dark pixels sit to the right of the glyph.
-    """
     if guess not in ("q", "o") or width < 8 or height < 8 or stride < 3:
         return guess
     minx, miny, maxx, maxy = width, height, -1, -1
@@ -219,7 +202,6 @@ def settle_qo(raw: bytes, width: int, height: int, stride: int, guess: str) -> s
         return "o"
     return guess
 
-
 def _classify(raw: bytes, width: int, height: int, stride: int) -> str:
     _ensure_templates()
     if not _TEMPLATES:
@@ -252,7 +234,6 @@ def _classify(raw: bytes, width: int, height: int, stride: int) -> str:
         return letter
     return ""
 
-
 def _is_white(raw: bytes, i: int) -> bool:
     r = raw[i]
     g = raw[i + 1]
@@ -264,7 +245,6 @@ def _is_white(raw: bytes, i: int) -> bool:
     if b < lo:
         lo = b
     return lo > 198 and hi - lo < 40
-
 
 def _components(mask: bytearray, width: int, height: int) -> list[tuple[int, int, int, int, int]]:
     parent: list[int] = []
@@ -317,8 +297,7 @@ def _components(mask: bytearray, width: int, height: int) -> list[tuple[int, int
             if y > box[3]:
                 box[3] = y
             box[4] += x1 - x0
-    return [tuple(box) for box in boxes.values()]  # type: ignore[misc]
-
+    return [tuple(box) for box in boxes.values()]
 
 def _crop(raw: bytes, width: int, stride: int, x: int, y: int, w: int, h: int) -> bytes:
     out = bytearray(w * h * stride)
@@ -327,10 +306,8 @@ def _crop(raw: bytes, width: int, stride: int, x: int, y: int, w: int, h: int) -
         out[row * w * stride : (row + 1) * w * stride] = raw[start : start + w * stride]
     return bytes(out)
 
-
 _HEADER_KEY = None
 _HEADER_VALUE = ""
-
 
 def _header_text(raw: bytes, width: int, height: int, stride: int, name: str) -> str:
     global _HEADER_KEY, _HEADER_VALUE
@@ -348,7 +325,7 @@ def _header_text(raw: bytes, width: int, height: int, stride: int, name: str) ->
     if key == _HEADER_KEY:
         return _HEADER_VALUE
     band_h = max(8, int(height * 0.16))
-    # Full resolution. A downsampled banner makes every name look the same.
+
     step = 1
     sw = width // step
     sh = band_h // step
@@ -377,7 +354,6 @@ def _header_text(raw: bytes, width: int, height: int, stride: int, name: str) ->
     _HEADER_VALUE = text
     return text
 
-
 def _text_line(bits: bytearray, width: int, height: int) -> tuple[int, int] | None:
     rows = [y for y in range(height) if sum(bits[y * width : (y + 1) * width]) > max(8, width // 80)]
     if not rows:
@@ -392,7 +368,6 @@ def _text_line(bits: bytearray, width: int, height: int) -> tuple[int, int] | No
         if y - start > best[1] - best[0]:
             best = (start, y, y - start)
     return best[0], best[1]
-
 
 def _text_hit(bits: bytearray, width: int, height: int, text: str) -> bool:
     line = _text_line(bits, width, height)
@@ -440,9 +415,8 @@ def _text_hit(bits: bytearray, width: int, height: int, text: str) -> bool:
                 return True
     return best >= 0.8
 
-
 def scan_rgba(raw: bytes, width: int, height: int, name: str = "") -> dict:
-    """Return the tile word and the turn line. `full` is false when a tile was missed."""
+
     if width < 8 or height < 8 or len(raw) < width * height * 4:
         return {"prompt": "", "header": "", "tiles": 0, "ms": 0, "full": False}
     header = _header_text(raw, width, height, 4, name)
@@ -485,8 +459,7 @@ def scan_rgba(raw: bytes, width: int, height: int, name: str = "") -> dict:
     letters = []
     pad = max(step, 2)
     for x, y, w, h in row:
-        # The mask is sampled, so the box can spill onto the dark gap.
-        # That gap must not be treated as part of the letter.
+
         if w > pad * 4 and h > pad * 4:
             x += pad
             y += pad
@@ -500,7 +473,6 @@ def scan_rgba(raw: bytes, width: int, height: int, name: str = "") -> dict:
         full = True
         prompt = ""
     return {"prompt": prompt, "header": header, "tiles": len(row), "ms": 0, "full": full}
-
 
 def _best_row(tiles: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
     best: list[tuple[int, int, int, int]] = []

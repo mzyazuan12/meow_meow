@@ -35,7 +35,6 @@ static int roblox_window(void) {
     return found;
 }
 
-// RGBA bytes in the same top-left layout the reader scans. Caller frees *out.
 int ll_grab(unsigned char **out, int *w, int *h) {
     if (out) *out = NULL;
     if (w) *w = 0;
@@ -44,7 +43,7 @@ int ll_grab(unsigned char **out, int *w, int *h) {
     if (!ll_capture) return 0;
     int wid = roblox_window();
     if (!wid) return 0;
-    // Logical resolution first. Retina is the fallback when that capture comes back empty.
+
     uint32_t options[] = {
         kCGWindowImageBoundsIgnoreFraming,
         kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution,
@@ -62,8 +61,7 @@ int ll_grab(unsigned char **out, int *w, int *h) {
     if (!img) return 0;
     size_t W = CGImageGetWidth(img);
     size_t H = CGImageGetHeight(img);
-    // A 4K grab is tens of megabytes. An 8GB laptop cannot keep one of those
-    // on the heap every frame, and the tiles are still readable below this.
+
     if (W < 200 || H < 200 || W > 8000 || H > 8000) {
         CGImageRelease(img);
         return 0;
@@ -80,8 +78,7 @@ int ll_grab(unsigned char **out, int *w, int *h) {
     CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), img);
     CGContextRelease(ctx);
     CGImageRelease(img);
-    // Keep the letter edges. Averaging a retina frame turns Y into W,
-    // so this keeps one pixel and drops the rest. 1280 is enough for the tiles.
+
     if (W > 1280) {
         int factor = (int)((W + 1279) / 1280);
         if (factor < 2) factor = 2;

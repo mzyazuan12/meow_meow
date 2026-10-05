@@ -1,5 +1,3 @@
-"""DYOE2.0 search engine — last.txt dictionary + phase/trap ranking."""
-
 from __future__ import annotations
 
 import json
@@ -23,24 +21,20 @@ DEFAULT_CANCELLED_PROMPTS_PATH = (
     Path.home() / ".last-letter-helper" / "dyoe2_cancelled_prompts.json"
 )
 
-# Hard-excluded trap prefixes (never suggested / never shown in priority UI).
 BLACKLISTED_TRAP_PREFIXES = frozenset({"bj"})
 
 _SPLIT_SUFFIXES = re.compile(r"[,;\s]+")
 
-
 def resource_path(*parts: str) -> Path:
     return REPO_ROOT.joinpath(*parts)
 
-
 def parse_trap_prefix_line(line: str) -> str | None:
-    """Extract the leading PREFIX column from a trap / prefix TSV line."""
+
     text = line.strip()
     if not text or text.startswith("#"):
         return None
     prefix = text.split("\t", 1)[0].strip().lower()
     return prefix or None
-
 
 def load_prefixes_from_lines(
     lines: Sequence[str],
@@ -49,11 +43,7 @@ def load_prefixes_from_lines(
     end_line: int | None = None,
     lengths: set[int] | None = None,
 ) -> list[str]:
-    """
-    Parse PREFIX values from 1-indexed inclusive line ranges.
 
-    Preserves first-seen order (caller can merge tiers).
-    """
     out: list[str] = []
     seen: set[str] = set()
     for idx, raw in enumerate(lines, start=1):
@@ -72,7 +62,6 @@ def load_prefixes_from_lines(
         out.append(prefix)
     return out
 
-
 def load_prefixes_from_file(
     path: Path | str,
     *,
@@ -85,9 +74,8 @@ def load_prefixes_from_file(
         text, start_line=start_line, end_line=end_line, lengths=lengths
     )
 
-
 def merge_prefix_tiers(*tiers: Iterable[str]) -> list[str]:
-    """Concatenate tiers, keeping the earliest occurrence of each prefix."""
+
     out: list[str] = []
     seen: set[str] = set()
     for tier in tiers:
@@ -98,7 +86,6 @@ def merge_prefix_tiers(*tiers: Iterable[str]) -> list[str]:
             seen.add(key)
             out.append(key)
     return out
-
 
 def normalize_hybrid_suffixes(raw: str) -> tuple[str, ...]:
     parts = [p.strip().lower() for p in _SPLIT_SUFFIXES.split(raw) if p.strip()]
@@ -111,14 +98,11 @@ def normalize_hybrid_suffixes(raw: str) -> tuple[str, ...]:
         out.append(part)
     return tuple(out)
 
-
 def word_has_punctuation(word: str) -> bool:
     return "-" in word or "'" in word
 
-
 @dataclass(frozen=True)
 class CancelAnalysis:
-    """Altver-Coiny Cancel Law result for one prompt/stem."""
 
     prompt: str
     groups: dict[str, tuple[str, ...]]
@@ -133,15 +117,10 @@ class CancelAnalysis:
             key=lambda item: (-item[1], item[0]),
         )
 
-
 def group_words_by_next_letter(
     prompt: str, words: Iterable[str]
 ) -> dict[str, list[str]]:
-    """
-    Group full words by the first letter immediately after the prompt.
 
-    The exact prompt word (if present) is its own empty-key group.
-    """
     lower = prompt.strip().lower()
     groups: dict[str, list[str]] = defaultdict(list)
     for raw in words:
@@ -154,14 +133,8 @@ def group_words_by_next_letter(
         groups[word[len(lower)]].append(word)
     return {key: sorted(values) for key, values in groups.items()}
 
-
 def analyze_cancel(prompt: str, words: Iterable[str]) -> CancelAnalysis:
-    """
-    Cancel Law: keep the two largest next-letter groups; cancel every other group.
 
-    Ties break by letter ascending so kept keys are stable. Listing a cancelled
-    group means listing every full word in that group.
-    """
     lower = prompt.strip().lower()
     groups = group_words_by_next_letter(lower, words)
     ordered = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
@@ -183,7 +156,6 @@ def analyze_cancel(prompt: str, words: Iterable[str]) -> CancelAnalysis:
         kept_words=tuple(kept_words),
     )
 
-
 @dataclass
 class TrapPools:
     casual_2: list[str] = field(default_factory=list)
@@ -192,13 +164,11 @@ class TrapPools:
     pro_2: list[str] = field(default_factory=list)
     pro_3: list[str] = field(default_factory=list)
     pro_4: list[str] = field(default_factory=list)
-    # Immutable source hierarchy. Each value is an ordered list of source tiers;
-    # only prefixes inside the same tier may rotate.
+
     source_tiers: dict[str, list[list[str]]] = field(default_factory=dict)
 
-
 def disjoint_prefix_tiers(*tiers: Iterable[str]) -> list[list[str]]:
-    """Deduplicate tiers while preserving both source and row priority."""
+
     result: list[list[str]] = []
     seen: set[str] = set()
     for tier in tiers:
@@ -211,7 +181,6 @@ def disjoint_prefix_tiers(*tiers: Iterable[str]) -> list[list[str]]:
             current.append(key)
         result.append(current)
     return result
-
 
 def build_trap_pools(
     *,
@@ -266,7 +235,6 @@ def build_trap_pools(
         pools = filter_giveable_pools(pools, giveable)
     return pools
 
-
 def filter_blacklisted_pools(pools: TrapPools) -> TrapPools:
     def keep(items: list[str]) -> list[str]:
         return [p for p in items if p not in BLACKLISTED_TRAP_PREFIXES]
@@ -284,7 +252,6 @@ def filter_blacklisted_pools(pools: TrapPools) -> TrapPools:
         pro_4=keep(pools.pro_4),
         source_tiers=source_tiers,
     )
-
 
 def filter_giveable_pools(pools: TrapPools, giveable: set[str]) -> TrapPools:
     def keep(items: list[str]) -> list[str]:
@@ -308,13 +275,12 @@ def filter_giveable_pools(pools: TrapPools, giveable: set[str]) -> TrapPools:
         source_tiers=source_tiers,
     )
 
-
 def build_giveable_suffix_set(words: Sequence[str], suffixes: Iterable[str]) -> set[str]:
-    """Return the subset of suffixes that at least one word ends with."""
+
     wanted = {s.lower() for s in suffixes}
     if not wanted:
         return set()
-    # Group by length for faster endswith checks.
+
     by_len: dict[int, set[str]] = {}
     for s in wanted:
         by_len.setdefault(len(s), set()).add(s)
@@ -333,16 +299,10 @@ def build_giveable_suffix_set(words: Sequence[str], suffixes: Iterable[str]) -> 
             break
     return found
 
-
 def build_giveable_via_reversed(
     words: Sequence[str], suffixes: Iterable[str]
 ) -> set[str]:
-    """
-    Fast giveable check using a sorted reversed-word index.
 
-    A suffix S is giveable iff some word W ends with S, i.e. reversed(W)
-    starts with reversed(S).
-    """
     reversed_words = sorted(w[::-1] for w in words)
     giveable: set[str] = set()
     for suffix in suffixes:
@@ -350,21 +310,17 @@ def build_giveable_via_reversed(
         rev = key[::-1]
         start = bisect_left(reversed_words, rev)
         if start < len(reversed_words) and reversed_words[start].startswith(rev):
-            # Must be a proper ending on some real word (word longer or equal).
-            # Equal length means the word IS the suffix — still giveable as ending.
+
             giveable.add(key)
     return giveable
-
 
 @dataclass
 class RankedWord:
     word: str
-    trap_rank: int  # lower is better; large sentinel = no trap match
+    trap_rank: int
     trap_suffix: str | None = None
 
-
 class Dyoe2Engine:
-    """Prefix searcher with Casual/Pro phase trap ranking and a 3-word queue."""
 
     NO_TRAP_RANK = 10_000_000
 
@@ -380,9 +336,9 @@ class Dyoe2Engine:
         self.traps = traps or TrapPools()
         self.used_words: set[str] = set()
         self.casual_mode = True
-        self.phase = 1  # 1-4, 5 = hybrid
+        self.phase = 1
         self.hybrid_suffixes: tuple[str, ...] = ()
-        # User drag-order overrides: key "casual:2" / "pro:3" → ordered prefixes
+
         self.priority_orders: dict[str, list[str]] = {}
         self.priority_path = DEFAULT_PRIORITY_PATH
         self.cancelled_prompts: set[str] = set()
@@ -624,13 +580,7 @@ class Dyoe2Engine:
         )
 
     def cancel_source_words(self, prompt: str) -> list[str]:
-        """
-        Full valid words for Cancel Law.
 
-        Includes the exact stem when it is a dictionary word. Hyphen /
-        apostrophe words are excluded so groups match casual / audit rules.
-        Used-word filtering is intentionally skipped.
-        """
         lower = prompt.strip().lower()
         if not lower:
             return []
@@ -666,7 +616,7 @@ class Dyoe2Engine:
     def default_trap_tiers(
         self, phase: int, *, casual: bool | None = None
     ) -> list[list[str]]:
-        """Return immutable source tiers in their required authority order."""
+
         use_casual = self.casual_mode if casual is None else casual
         key = self.priority_key(use_casual, phase)
         tiers = self.traps.source_tiers.get(key)
@@ -741,8 +691,7 @@ class Dyoe2Engine:
     ) -> list[str]:
         use_casual = self.casual_mode if casual is None else casual
         key = self.priority_key(use_casual, phase)
-        # Apply the requested ordering only inside each immutable source tier.
-        # A general traps.txt prefix can never jump above SPECIAL or NO-DYOE.
+
         tiers = [
             self.apply_priority_order(tier, order)
             for tier in self.default_trap_tiers(phase, casual=use_casual)
@@ -763,7 +712,7 @@ class Dyoe2Engine:
         casual: bool | None = None,
         persist: bool = True,
     ) -> list[str]:
-        """Reorder one source tier without allowing cross-tier promotion."""
+
         use_casual = self.casual_mode if casual is None else casual
         tiers = self.get_ordered_trap_tiers(phase, casual=use_casual)
         if not (0 <= tier_index < len(tiers)):
@@ -794,7 +743,7 @@ class Dyoe2Engine:
     def rotate_for_new_game(
         self, *, casual: bool | None = None, persist: bool = True
     ) -> None:
-        """Rotate every phase inside each source tier; source hierarchy stays fixed."""
+
         use_casual = self.casual_mode if casual is None else casual
         for phase in (2, 3, 4):
             tiers = self.get_ordered_trap_tiers(phase, casual=use_casual)
@@ -807,8 +756,7 @@ class Dyoe2Engine:
             self.priority_orders[self.priority_key(use_casual, phase)] = [
                 prefix for tier in rotated for prefix in tier
             ]
-        # User-entered Hybrid suffixes are an explicit, fixed priority order.
-        # New Game rotates built-in source tiers only.
+
         if persist:
             self.save_priority_orders()
         self.clear_cache()
@@ -817,7 +765,7 @@ class Dyoe2Engine:
         return self.get_ordered_traps(phase)
 
     def _hybrid_fallback_traps(self) -> list[str]:
-        """Phase 4 → 3 → 2 trap tiers for hybrid fallback."""
+
         return merge_prefix_tiers(
             self._trap_list_for_phase(4),
             self._trap_list_for_phase(3),
@@ -825,7 +773,7 @@ class Dyoe2Engine:
         )
 
     def _words_ending_with(self, suffix: str) -> list[str]:
-        """Return dictionary words ending with suffix (via reversed index)."""
+
         if not suffix:
             return []
         rev = suffix[::-1]
@@ -841,18 +789,9 @@ class Dyoe2Engine:
         seen: set[str],
         shortest_first: bool = False,
     ) -> list[str]:
-        """Words starting with prompt, ending with trap, unused/allowed, not seen.
 
-        Built-in traps (not hybrid custom shortest-first): if the trap itself is
-        still an unused dictionary word, only offer that exact word. Giving a
-        longer *…trap word (e.g. alaskas for skas) lets the opponent self-solve
-        by entering the trap word and leaves you holding the bag.
-        Once the exact trap word is used — or the trap isn't a real word —
-        longer endings are fine again.
-        """
         lower = prompt.strip().lower()
 
-        # Self-solve guard: live unused trap-word → exact match only.
         if (
             not shortest_first
             and self._is_known_word(trap)
@@ -878,8 +817,7 @@ class Dyoe2Engine:
             if not self._is_allowed_word(word):
                 continue
             matches.append(word)
-        # Hybrid custom endings want the shortest giveable word; built-in traps
-        # still prefer the longest match (default spam / trap play).
+
         if shortest_first:
             matches.sort(key=lambda w: (len(w), w))
         else:
@@ -916,7 +854,7 @@ class Dyoe2Engine:
         *,
         limit: int | None = None,
     ) -> list[str]:
-        """Score a candidate list (used by tests / small pools)."""
+
         if not candidates:
             return []
         if not trap_suffixes:
@@ -940,15 +878,7 @@ class Dyoe2Engine:
         then_traps: Sequence[str] | None = None,
         primary_shortest_first: bool = False,
     ) -> list[str]:
-        """Priority-order trap walk — returns up to `limit` best words.
 
-        If `then_traps` is provided, exhaust matches from `trap_suffixes` first,
-        then continue filling from `then_traps` (used by Phase 4 Hybrid).
-
-        When `primary_shortest_first` is set (Phase 4 Hybrid custom endings),
-        words for each primary suffix are ordered shortest-first. Fallback traps
-        use the built-in exact-trap self-solve guard, then longest-first.
-        """
         lower = prompt.strip().lower()
         out: list[str] = []
         seen: set[str] = set()
@@ -976,7 +906,6 @@ class Dyoe2Engine:
         if len(out) >= limit:
             return out
 
-        # Fallback: longest remaining prefix completions (no trap match).
         fallback = self.prefix_candidates(lower)
         fallback.sort(key=lambda w: (-len(w), w))
         for word in fallback:
@@ -1000,7 +929,7 @@ class Dyoe2Engine:
         )
 
     def ranked_words(self, prompt: str, *, limit: int | None = None) -> list[str]:
-        # Always materialize a generous pool so ALREADY USED can advance smoothly.
+
         pool_limit = 256 if limit is None else max(limit, 256)
         key = self._cache_key(prompt)
         if self._ranked_cache_key == key and self._ranked_cache:
@@ -1012,8 +941,7 @@ class Dyoe2Engine:
             elif self.phase == 5:
                 custom = list(self.hybrid_suffixes)
                 fallback = self._hybrid_fallback_traps()
-                # Custom hybrid endings always outrank every built-in trap.
-                # Within each custom ending, prefer the shortest matching word.
+
                 ranked = self._rank_by_trap_walk(
                     prompt,
                     custom,
@@ -1029,8 +957,6 @@ class Dyoe2Engine:
                     candidates = self.prefix_candidates(prompt)
                     ranked = sorted(candidates, key=lambda w: (-len(w), w))
 
-            # Casual Cancel Law: cancelled prompts surface every cancel word
-            # first, then the normal ranked remainder for that stem.
             if self.casual_mode and self.is_prompt_cancelled(prompt):
                 ranked = self._apply_cancel_priority(prompt, ranked)
 
@@ -1050,18 +976,17 @@ class Dyoe2Engine:
             return list(ranked)
         seen = set(cancel_first)
         rest = [word for word in ranked if word not in seen]
-        # Exact stem can be a cancel word but never appears in prefix_candidates.
+
         return cancel_first + rest
 
     def ensure_queue(self, prompt: str, *, size: int = 3) -> list[str]:
-        """Rebuild queue from ranked list when prompt/mode changes or queue empty."""
+
         ranked = self.ranked_words(prompt)
-        # Keep current queue order when possible (after side swaps), filtering used.
+
         if self._queue:
             kept = [w for w in self._queue if w not in self.used_words and w in set(ranked)]
             if kept and kept[0] in ranked:
-                # Preserve user-swapped front order: start from current queue members,
-                # then append remaining ranked words.
+
                 seen = set(kept)
                 merged = list(kept)
                 for word in ranked:
@@ -1071,7 +996,7 @@ class Dyoe2Engine:
                     if len(merged) >= size:
                         break
                 self._queue = merged[:size]
-                # Pad if needed
+
                 if len(self._queue) < size:
                     for word in ranked:
                         if word not in self._queue:
@@ -1084,7 +1009,7 @@ class Dyoe2Engine:
         return list(self._queue)
 
     def reset_queue_from_rank(self, prompt: str, *, size: int = 3) -> list[str]:
-        """Force queue to top-N ranked (used on prompt / mode / phase change)."""
+
         ranked = self.ranked_words(prompt)
         self._queue = ranked[:size]
         return list(self._queue)
@@ -1097,7 +1022,7 @@ class Dyoe2Engine:
         return front, side_top, side_bottom
 
     def promote_side(self, prompt: str, which: str) -> tuple[str | None, str | None, str | None]:
-        """Swap a side card into the front. which is 'top' or 'bottom'."""
+
         self.ensure_queue(prompt, size=3)
         if len(self._queue) < 2:
             return self.get_display_words(prompt)
@@ -1108,12 +1033,7 @@ class Dyoe2Engine:
         return self.get_display_words(prompt)
 
     def matched_trap_for_word(self, word: str) -> tuple[int, str] | None:
-        """
-        Best trap ending that explains why this word was chosen.
 
-        Returns (phase, trap) where phase is 2/3/4 for built-in traps,
-        or 5 for a hybrid custom suffix.
-        """
         lower = word.lower().strip()
         if not lower:
             return None
@@ -1155,13 +1075,13 @@ class Dyoe2Engine:
         casual: bool | None = None,
         persist: bool = True,
     ) -> bool:
-        """Move a used trap to its source tier's end so peers get a turn."""
+
         key = trap.lower().strip()
         if not key or key in BLACKLISTED_TRAP_PREFIXES:
             return False
 
         if phase == 5:
-            # Custom Hybrid suffix priority is user-specified and never decays.
+
             return False
 
         if phase not in (2, 3, 4):
@@ -1183,7 +1103,7 @@ class Dyoe2Engine:
         return False
 
     def already_used(self, prompt: str) -> tuple[str | None, str | None, str | None]:
-        """Mark front word used, decay its trap priority, and advance the queue."""
+
         self.ensure_queue(prompt, size=3)
         self.last_decayed_trap = None
         self.last_decayed_phase = None
@@ -1199,9 +1119,6 @@ class Dyoe2Engine:
                 self.last_decayed_trap = trap
                 self.last_decayed_phase = phase
 
-        # Rebuild all three slots from the fresh top-to-bottom priority order.
-        # Keeping old side slots here would let a now-deprioritized trap remain
-        # in front even though the priority editor/order has changed.
         ranked = self.ranked_words(prompt)
         self._queue = ranked[:3]
         return self.get_display_words(prompt)

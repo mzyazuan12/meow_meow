@@ -1,5 +1,3 @@
-"""Keyboard, focus, and the Roblox picture. Works on macOS, Windows, and Linux."""
-
 from __future__ import annotations
 
 import ctypes
@@ -14,9 +12,8 @@ _ROOT = Path(__file__).resolve().parent
 _WATCH = _ROOT / "llwatch"
 _CAP = _ROOT / "llcap.dylib"
 _PROCS: list[subprocess.Popen] = []
-# Wider than this and a laptop with 8GB starts swapping on every grab.
-_FRAME_MAX = 1280
 
+_FRAME_MAX = 1280
 
 def _fit_frame(width: int, height: int, max_w: int = _FRAME_MAX):
     if width <= max_w or width < 4 or height < 4:
@@ -28,12 +25,10 @@ def _fit_frame(width: int, height: int, max_w: int = _FRAME_MAX):
         return 1, width, height
     return factor, tw, th
 
-
 def stop_capture() -> None:
     for proc in _PROCS:
         if proc.poll() is None:
             proc.kill()
-
 
 def roblox_running() -> bool:
     if sys.platform == "darwin":
@@ -44,7 +39,6 @@ def roblox_running() -> bool:
         return _win_process()
     return _linux_process()
 
-
 def focus_roblox() -> bool:
     if sys.platform == "darwin":
         from autotype.mac_input import focus_roblox as _mac
@@ -53,7 +47,6 @@ def focus_roblox() -> bool:
     if sys.platform == "win32":
         return _win_focus()
     return _linux_focus()
-
 
 def tap_key(kind: str, key: str, hold: float = 0.016) -> None:
     if sys.platform == "darwin":
@@ -68,7 +61,6 @@ def tap_key(kind: str, key: str, hold: float = 0.016) -> None:
         return
     _key_event(key[0], hold)
 
-
 def press_enter() -> None:
     if sys.platform == "darwin":
         from autotype.mac_input import press_enter as _mac
@@ -77,20 +69,15 @@ def press_enter() -> None:
         return
     _key_event("\n", 0.012)
 
-
 def run_capture(stop: threading.Event, on_frame, on_status, name_fn) -> None:
-    """Push screen readings until `stop` is set.
 
-    `on_status` receives "up", "down" (Roblox isn't running), or "hidden".
-    """
     if sys.platform == "darwin" and _WATCH.is_file() and _CAP.is_file():
         _run_mac_native(stop, on_frame, on_status)
         return
     _run_portable(stop, on_frame, on_status, name_fn)
 
-
 def _shrink_rgba(raw: bytes, width: int, height: int, max_w: int = _FRAME_MAX):
-    """Drop extra pixels so a retina frame is not copied around at full size."""
+
     factor, tw, th = _fit_frame(width, height, max_w)
     if factor == 1:
         return raw, width, height
@@ -105,7 +92,6 @@ def _shrink_rgba(raw: bytes, width: int, height: int, max_w: int = _FRAME_MAX):
             out[dst : dst + 4] = raw[i : i + 4]
             dst += 4
     return bytes(out), tw, th
-
 
 def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
     from autotype.mac_input import roblox_running as mac_running
@@ -148,8 +134,7 @@ def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
                 count = width.value * height.value * 4
                 if count <= 0 or count > 12_000_000:
                     continue
-                # Cast first. free() on the POINTER object itself does not
-                # release the pixels, so every grab was kept.
+
                 address = ctypes.cast(ptr, ctypes.c_void_p)
                 raw = ctypes.string_at(address, count)
             finally:
@@ -165,12 +150,11 @@ def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
             except (BrokenPipeError, OSError):
                 return
             del payload
-            # One small frame at a time. A tight grab loop was the memory spike.
+
             time.sleep(0.08)
     finally:
         if proc.poll() is None:
             proc.kill()
-
 
 def _read_watch(proc: subprocess.Popen, stop: threading.Event, on_frame) -> None:
     if proc.stdout is None:
@@ -181,7 +165,6 @@ def _read_watch(proc: subprocess.Popen, stop: threading.Event, on_frame) -> None
         frame = _parse_frame(raw.decode("utf-8", "replace"))
         if frame is not None:
             on_frame(frame)
-
 
 def _parse_frame(line: str):
     parts = line.rstrip("\n").split("\t")
@@ -212,7 +195,6 @@ def _parse_frame(line: str):
         "error": data.get("ERROR", ""),
     }
 
-
 def _run_portable(stop: threading.Event, on_frame, on_status, name_fn) -> None:
     from autotype.tiles import scan_rgba
 
@@ -237,7 +219,6 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn) -> None:
         on_frame(frame)
         time.sleep(0.08)
 
-
 def _grab():
     if sys.platform == "win32":
         return _grab_win()
@@ -245,13 +226,11 @@ def _grab():
         return _grab_mac()
     return _grab_linux()
 
-
 def _key_event(ch: str, hold: float) -> None:
     if sys.platform == "win32":
         _win_key(ch, hold)
     else:
         _linux_key(ch, hold)
-
 
 def _win_process() -> bool:
     try:
@@ -276,7 +255,6 @@ def _win_process() -> bool:
 
     user32.EnumWindows(visit, 0)
     return bool(found)
-
 
 def _win_hwnd():
     user32 = ctypes.windll.user32
@@ -303,7 +281,6 @@ def _win_hwnd():
     found.sort()
     return found[-1][1]
 
-
 def _win_focus() -> bool:
     try:
         hwnd = _win_hwnd()
@@ -328,7 +305,6 @@ def _win_focus() -> bool:
         time.sleep(0.012)
     return user32.GetForegroundWindow() == hwnd
 
-
 def _win_key(ch: str, hold: float) -> None:
     user32 = ctypes.windll.user32
     vk, shift = _win_vk(ch)
@@ -343,7 +319,6 @@ def _win_key(ch: str, hold: float) -> None:
     if shift:
         _win_send(0x10, True)
 
-
 def _win_vk(ch: str):
     user32 = ctypes.windll.user32
     if ch == "\n":
@@ -355,9 +330,7 @@ def _win_vk(ch: str):
         return None, False
     return scanned & 0xFF, bool(scanned & 0x100)
 
-
 _WIN_INPUT = None
-
 
 def _win_input_type():
     global _WIN_INPUT
@@ -399,7 +372,6 @@ def _win_input_type():
     _WIN_INPUT = INPUT
     return INPUT
 
-
 def _win_send(vk: int, up: bool) -> None:
     user32 = ctypes.windll.user32
     scan = user32.MapVirtualKeyW(vk, 0)
@@ -411,7 +383,6 @@ def _win_send(vk: int, up: bool) -> None:
     event.union.ki.wScan = scan
     event.union.ki.dwFlags = flags
     user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event))
-
 
 def _grab_win():
     try:
@@ -434,7 +405,7 @@ def _grab_win():
     memory = gdi32.CreateCompatibleDC(desktop)
     bitmap = gdi32.CreateCompatibleBitmap(desktop, dst_w, dst_h)
     old = gdi32.SelectObject(memory, bitmap)
-    # COLORONCOLOR keeps a hard letter edge. HALFTONE blurs Y into W.
+
     gdi32.SetStretchBltMode(memory, 3)
     ok = gdi32.StretchBlt(
         memory, 0, 0, dst_w, dst_h,
@@ -471,9 +442,8 @@ def _grab_win():
     user32.ReleaseDC(0, desktop)
     if not ok:
         return None
-    # White and black don't care which channel is red. Skip a second copy of the frame.
-    return buf.raw, dst_w, dst_h
 
+    return buf.raw, dst_w, dst_h
 
 def _grab_mac():
     if not _CAP.is_file():
@@ -498,7 +468,6 @@ def _grab_mac():
     finally:
         libc.free(ptr)
 
-
 def _linux_process() -> bool:
     proc = Path("/proc")
     if not proc.is_dir():
@@ -517,7 +486,6 @@ def _linux_process() -> bool:
         return False
     return False
 
-
 def _linux_display():
     try:
         x11 = ctypes.CDLL("libX11.so.6")
@@ -526,7 +494,6 @@ def _linux_display():
     x11.XOpenDisplay.restype = ctypes.c_void_p
     display = x11.XOpenDisplay(None)
     return x11, display
-
 
 def _linux_focus() -> bool:
     x11, display = _linux_display()
@@ -540,7 +507,6 @@ def _linux_focus() -> bool:
     x11.XFlush(display)
     x11.XCloseDisplay(display)
     return True
-
 
 def _linux_window(x11, display):
     root = x11.XDefaultRootWindow(display)
@@ -577,7 +543,6 @@ def _linux_window(x11, display):
     walk(root)
     return found[0] if found else 0
 
-
 def _linux_key(ch: str, hold: float) -> None:
     try:
         xtst = ctypes.CDLL("libXtst.so.6")
@@ -605,13 +570,11 @@ def _linux_key(ch: str, hold: float) -> None:
         x11.XFlush(display)
     x11.XCloseDisplay(display)
 
-
 def _grab_linux():
     try:
         return _grab_linux_image()
     except Exception:
         return None
-
 
 def _grab_linux_image():
     x11, display = _linux_display()
@@ -660,8 +623,7 @@ def _grab_linux_image():
     if not image:
         x11.XCloseDisplay(display)
         return None
-    # XImage layout: data pointer sits after a few words. Read width*height*4 from XImage.data.
-    # Offset of `data` is stable enough on 64-bit libX11 (after width, height, xoffset, format, byte_order, bitmap_unit, bitmap_bit_order, bitmap_pad, depth, bytes_per_line, bits_per_pixel).
+
     class XImage(ctypes.Structure):
         _fields_ = [
             ("width", ctypes.c_int),

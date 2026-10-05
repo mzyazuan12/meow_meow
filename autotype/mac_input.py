@@ -1,5 +1,3 @@
-"""Post keystrokes to the front app. Roblox only sees them when it is focused."""
-
 from __future__ import annotations
 
 import ctypes
@@ -15,7 +13,6 @@ _CG.CGEventSetFlags.argtypes = [c_void_p, c_uint32]
 _HID = 0
 _FLAG_SHIFT = 1 << 17
 
-# US ANSI virtual key codes.
 _LETTERS = {
     "a": 0x00,
     "s": 0x01,
@@ -51,10 +48,8 @@ _EXTRA = {
 _RETURN = 0x24
 _DELETE = 0x33
 
-
 _CF = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 _CF.CFRelease.argtypes = [c_void_p]
-
 
 def _post(keycode: int, down: bool, flags: int = 0) -> None:
     event = _CG.CGEventCreateKeyboardEvent(None, c_uint16(keycode), c_int(1 if down else 0))
@@ -64,7 +59,6 @@ def _post(keycode: int, down: bool, flags: int = 0) -> None:
         _CG.CGEventSetFlags(event, c_uint32(flags))
     _CG.CGEventPost(c_uint32(_HID), event)
     _CF.CFRelease(event)
-
 
 def tap_key(kind: str, key: str, hold: float = 0.008) -> None:
     if kind == "back":
@@ -88,11 +82,9 @@ def tap_key(kind: str, key: str, hold: float = 0.008) -> None:
     time.sleep(hold)
     _post(code, False, flags)
 
-
 def press_enter() -> None:
     _post(_RETURN, True)
     _post(_RETURN, False)
-
 
 def _objc():
     ctypes.CDLL("/System/Library/Frameworks/AppKit.framework/AppKit")
@@ -103,14 +95,12 @@ def _objc():
     lib.sel_registerName.argtypes = [ctypes.c_char_p]
     return lib
 
-
 def _msg(ret, obj, sel, *args, argtypes=()):
     lib = _objc()
     send = lib.objc_msgSend
     send.restype = ret
     send.argtypes = [c_void_p, c_void_p, *argtypes]
     return send(obj, lib.sel_registerName(sel.encode()), *args)
-
 
 def _nsstring(value) -> str:
     if not value:
@@ -120,10 +110,8 @@ def _nsstring(value) -> str:
         return ""
     return raw.decode("utf-8", "replace")
 
-
 def _ensure_app() -> None:
     _msg(c_void_p, _objc().objc_getClass(b"NSApplication"), "sharedApplication")
-
 
 def _roblox_app():
     _ensure_app()
@@ -137,7 +125,6 @@ def _roblox_app():
             return app
     return None
 
-
 def _front_pid() -> int:
     _ensure_app()
     workspace = _msg(c_void_p, _objc().objc_getClass(b"NSWorkspace"), "sharedWorkspace")
@@ -146,17 +133,15 @@ def _front_pid() -> int:
         return 0
     return int(_msg(ctypes.c_int, front, "processIdentifier"))
 
-
 def roblox_running() -> bool:
-    """True when a Roblox window process is open."""
+
     try:
         return _roblox_app() is not None
     except (OSError, AttributeError):
         return False
 
-
 def focus_roblox() -> bool:
-    """Bring Roblox forward. Keys only land in the match when it is frontmost."""
+
     try:
         app = _roblox_app()
     except (OSError, AttributeError):
@@ -166,7 +151,7 @@ def focus_roblox() -> bool:
     pid = int(_msg(ctypes.c_int, app, "processIdentifier"))
     if _front_pid() == pid:
         return True
-    # NSApplicationActivateIgnoringOtherApps
+
     _msg(ctypes.c_bool, app, "activateWithOptions:", 2, argtypes=(ctypes.c_ulong,))
     deadline = time.time() + 0.2
     while time.time() < deadline:
