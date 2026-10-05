@@ -20,10 +20,10 @@ Python 3.9 or newer, with tkinter. The dictionary, trap lists, and app are alrea
 - `autotype/`
 - `dyoe2_engine.py`
 - `dict (4).txt`
-- `lll-security-audit/traps.txt`
-- `lll-security-audit/special-traps.txt`
-- `lll-security-audit/traps-not-in-dyoe-no-plural.txt`
-- `lll-security-audit/poppi/prefix-solve-groups-3-4-prefixes.txt`
+- `data/casual-prefixes.txt`
+- `data/traps.txt`
+- `data/special-traps.txt`
+- `data/no-plural.txt`
 
 Install Pillow. Windows and Linux need it to read letters. Mac uses it only if the bundled reader is missing.
 

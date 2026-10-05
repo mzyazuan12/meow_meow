@@ -32,6 +32,11 @@ from autotype.session import (
 )
 
 DICT_PATH = _ROOT / "dict (4).txt"
+DATA = _ROOT / "data"
+CASUAL_PATH = DATA / "casual-prefixes.txt"
+TRAPS_PATH = DATA / "traps.txt"
+SPECIAL_PATH = DATA / "special-traps.txt"
+NO_PLURAL_PATH = DATA / "no-plural.txt"
 HELPER = Path.home() / ".last-letter-helper"
 NAME_PATH = HELPER / "autotype_name.txt"
 MODE_PATH = HELPER / "autotype_mode.txt"
@@ -413,7 +418,14 @@ class AutotypeApp:
 
     def _load(self) -> None:
         try:
-            count = self.engine.load_from_paths(DICT_PATH, validate_giveable=False)
+            count = self.engine.load_from_paths(
+                DICT_PATH,
+                casual_path=CASUAL_PATH,
+                traps_path=TRAPS_PATH,
+                special_path=SPECIAL_PATH,
+                no_plural_path=NO_PLURAL_PATH,
+                validate_giveable=False,
+            )
             self.session.set_mode(self._mode)
             self.session.set_spam_suffixes(self._spam)
             self._emit("LOADED", count)
