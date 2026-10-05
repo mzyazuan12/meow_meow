@@ -1,4 +1,4 @@
-# ll-doom
+# meow_meow
 
 Last Letter autotyper. It reads the Roblox tiles, picks a word, and types the ending.
 

@@ -148,9 +148,13 @@ def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
                 count = width.value * height.value * 4
                 if count <= 0 or count > 12_000_000:
                     continue
-                raw = ctypes.string_at(ptr, count)
+                # Cast first. free() on the POINTER object itself does not
+                # release the pixels, so every grab was kept.
+                address = ctypes.cast(ptr, ctypes.c_void_p)
+                raw = ctypes.string_at(address, count)
             finally:
-                libc.free(ptr)
+                if ptr:
+                    libc.free(ctypes.cast(ptr, ctypes.c_void_p))
             raw, tw, th = _shrink_rgba(raw, width.value, height.value)
             payload = struct.pack("<II", tw, th) + raw
             del raw

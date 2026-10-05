@@ -209,12 +209,30 @@ static char classify(const unsigned char *buf, int w, int h, float *outScore, fl
     return (char)('a' + bestI);
 }
 
+// One request for the whole process. A new VNRecognizeTextRequest per tile
+// reloads the text model and keeps every previous one, which is what grew
+// the reader into hundreds of gigabytes.
+static VNRecognizeTextRequest *shared_ocr_request(void) {
+    static VNRecognizeTextRequest *req = nil;
+    if (!req) {
+        req = [[VNRecognizeTextRequest alloc] init];
+        req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+        req.usesLanguageCorrection = NO;
+        req.recognitionLanguages = @[@"en-US"];
+    }
+    return req;
+}
+
 static NSString *ocr_text(CGImageRef cg, BOOL accurate) {
+    (void)accurate;
     if (!cg) return @"";
-    __block NSMutableString *text = [NSMutableString string];
-    VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *request, NSError *error) {
-        if (error) return;
-        NSArray *obs = request.results;
+    @autoreleasepool {
+        VNRecognizeTextRequest *req = shared_ocr_request();
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
+        NSError *error = nil;
+        if (![handler performRequests:@[req] error:&error] || error) return @"";
+        NSArray *obs = req.results;
+        if (obs.count == 0) return @"";
         NSMutableArray *rows = [NSMutableArray arrayWithArray:obs];
         [rows sortUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *a, VNRecognizedTextObservation *b) {
             CGFloat ay = a.boundingBox.origin.y;
@@ -223,19 +241,15 @@ static NSString *ocr_text(CGImageRef cg, BOOL accurate) {
             if (by > ay + 0.02) return NSOrderedDescending;
             return a.boundingBox.origin.x < b.boundingBox.origin.x ? NSOrderedAscending : NSOrderedDescending;
         }];
+        NSMutableString *text = [NSMutableString string];
         for (VNRecognizedTextObservation *o in rows) {
             VNRecognizedText *top = [[o topCandidates:1] firstObject];
             if (!top.string.length || top.confidence < 0.2) continue;
             if (text.length) [text appendString:@" "];
             [text appendString:top.string];
         }
-    }];
-    req.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
-    req.usesLanguageCorrection = NO;
-    req.recognitionLanguages = @[@"en-US"];
-    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
-    [handler performRequests:@[req] error:nil];
-    return text;
+        return [text copy];
+    }
 }
 
 static CGImageRef crop_image(CGImageRef src, int x, int y, int w, int h) {
@@ -320,22 +334,33 @@ static void one_frame(int wid) {
 }
 
 static CGImageRef image_from_buffer(const unsigned char *buf, size_t W, size_t H) {
+    // Copy into an image we own. The old provider pointed at the frame buffer,
+    // and Vision kept that buffer after the frame was freed.
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, buf, W * H * 4, NULL);
-    CGImageRef image = CGImageCreate(
-        W, H, 8, 32, W * 4, cs, kCGImageAlphaPremultipliedLast, provider, NULL, false,
-        kCGRenderingIntentDefault);
-    CGDataProviderRelease(provider);
+    CGContextRef ctx = CGBitmapContextCreate(NULL, W, H, 8, W * 4, cs, kCGImageAlphaPremultipliedLast);
     CGColorSpaceRelease(cs);
+    if (!ctx) return NULL;
+    void *dst = CGBitmapContextGetData(ctx);
+    if (dst) memcpy(dst, buf, W * H * 4);
+    CGImageRef image = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
     return image;
 }
 
+static int g_tile_ocr_left = 0;
+
 static unsigned long hash_tile(const unsigned char *buf, size_t W, Box box) {
+    // Ink or no ink. Raw pixel bytes flicker every frame and were forcing a
+    // fresh text scan of every letter, which is the memory leak.
     unsigned long hash = 1469598103934665603UL;
-    for (int y = box.y; y < box.y + box.h; y += 4) {
+    hash ^= (unsigned long)box.w;
+    hash *= 1099511628211UL;
+    hash ^= (unsigned long)box.h;
+    hash *= 1099511628211UL;
+    for (int y = box.y; y < box.y + box.h; y += 2) {
         const unsigned char *line = buf + (size_t)y * W * 4 + (size_t)box.x * 4;
-        for (int x = 0; x < box.w; x += 4) {
-            hash ^= line[x * 4];
+        for (int x = 0; x < box.w; x += 2) {
+            hash ^= dark_px(line + x * 4) ? 1UL : 0UL;
             hash *= 1099511628211UL;
         }
     }
@@ -345,6 +370,10 @@ static unsigned long hash_tile(const unsigned char *buf, size_t W, Box box) {
 static char looks_like_i(const unsigned char *buf, size_t W, size_t H, Box box);
 
 static char ocr_one_tile(const unsigned char *buf, size_t W, size_t H, Box box) {
+    // A new word is a handful of scans, then the tile cache takes over.
+    // Scanning every letter of every frame is what exhausted RAM.
+    if (g_tile_ocr_left <= 0) return 0;
+    g_tile_ocr_left--;
     // Keep the whole glyph. A deep crop clips M and W and the letter is dropped.
     int inset = box.w / 12;
     if (inset < 1) inset = 1;
@@ -495,9 +524,11 @@ static char read_letter(const unsigned char *buf, size_t W, size_t H, Box box) {
 }
 
 static NSString *read_tiles(const unsigned char *buf, size_t W, size_t H, Box *row, int nrow) {
-    static unsigned long seenHash[256];
-    static char seenLetter[256];
+    enum { SEEN_CAP = 96 };
+    static unsigned long seenHash[SEEN_CAP];
+    static char seenLetter[SEEN_CAP];
     static int seenCount = 0;
+    static int seenNext = 0;
     NSMutableString *letters = [NSMutableString string];
     for (int i = 0; i < nrow; i++) {
         unsigned long hash = hash_tile(buf, W, row[i]);
@@ -513,10 +544,16 @@ static NSString *read_tiles(const unsigned char *buf, size_t W, size_t H, Box *r
         if (!known) {
             ch = read_letter(buf, W, H, row[i]);
             // Don't remember a miss. A blurred frame was getting stuck as the letter.
-            if (ch && seenCount < 256) {
-                seenHash[seenCount] = hash;
-                seenLetter[seenCount] = ch;
-                seenCount++;
+            if (ch) {
+                if (seenCount < SEEN_CAP) {
+                    seenHash[seenCount] = hash;
+                    seenLetter[seenCount] = ch;
+                    seenCount++;
+                } else {
+                    seenHash[seenNext] = hash;
+                    seenLetter[seenNext] = ch;
+                    seenNext = (seenNext + 1) % SEEN_CAP;
+                }
             }
         }
         // A missed tile is not a shorter word. The caller keeps the last complete read.
@@ -601,6 +638,7 @@ static NSString *ocr_error_band(const unsigned char *buf, size_t W, size_t H, in
 
 static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    g_tile_ocr_left = 12;
     if (!buf || W < 8 || H < 8) {
         emit(@"", @"", 0, 0, 0, @"");
         return;
@@ -620,7 +658,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
     // a second, and keep the last turn line in between.
     static CFAbsoluteTime lastHeaderOcr = 0;
     CFAbsoluteTime headerNow = CFAbsoluteTimeGetCurrent();
-    if ((headHash != cachedHeadHash || !cachedHeader) && headerNow - lastHeaderOcr > 0.12) {
+    if ((headHash != cachedHeadHash || !cachedHeader) && headerNow - lastHeaderOcr > 0.45) {
         lastHeaderOcr = headerNow;
         unsigned char *bandBuf = malloc((size_t)headH * bpr);
         if (bandBuf) {
@@ -864,7 +902,7 @@ static void scan_buffer(unsigned char *buf, size_t W, size_t H) {
             if (edge > bottom) bottom = edge;
         }
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (now - lastErrorOcr > 0.22) {
+        if (now - lastErrorOcr > 0.6) {
             lastErrorOcr = now;
             NSString *text = ocr_error_band(buf, W, H, bottom) ?: @"";
             NSString *low = text.lowercaseString;
@@ -922,8 +960,9 @@ static void read_frames(void) {
         uint32_t wh[2];
         if (!read_full(wh, sizeof(wh))) return;
         uint32_t w = wh[0], h = wh[1];
-        if (w == 0 || h == 0 || w > 8000 || h > 8000) return;
-        size_t nbytes = (size_t)w * h * 4;
+        if (w == 0 || h == 0 || w > 1600 || h > 2048) return;
+        size_t nbytes = (size_t)w * (size_t)h * 4;
+        if (nbytes > 12 * 1024 * 1024) return;
         unsigned char *buf = malloc(nbytes);
         if (!buf || !read_full(buf, nbytes)) {
             free(buf);
