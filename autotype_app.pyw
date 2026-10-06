@@ -19,7 +19,8 @@ if str(_ROOT) not in sys.path:
 from dyoe2_engine import Dyoe2Engine
 
 from autotype.featherine import human_plan
-from autotype.host import focus_roblox, press_enter, roblox_focused, run_capture, stop_capture, tap_key
+from autotype.host import (focus_roblox, keyboard_available, request_keyboard_access,
+                           press_enter, roblox_focused, run_capture, stop_capture, tap_key)
 from autotype.session import (
     BoardWatch,
     MatchSession,
@@ -106,6 +107,7 @@ class AutotypeApp:
         self._last_note = ""
         self._status_at = 0.0
         self._lock = threading.Lock()
+        self._input_lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue(maxsize=128)
         self._name = ""
         self._aliases: set[str] = set()
@@ -119,6 +121,26 @@ class AutotypeApp:
         self._input_length = 0
         self._needs_clear = False
         self._input_problem = ""
+        self._paused = threading.Event()
+        self._manual_turn = False
+        self._manual_misses = 0
+        self._verify = None
+        self._verify_hits = 0
+        self._verify_board = ""
+        self._verify_repairs = 0
+        self._verify_read_at = 0.0
+        self._verify_letters: list[int] = []
+        self._clear = None
+        self._selection_retry_at = 0.0
+        self._submitted_at = 0.0
+        self._submit_attempts = 0
+        self._submit_hits = 0
+        self._submit_read_at = 0.0
+        self._new_prompt = ""
+        self._new_prompt_hits = 0
+        self._trial = None
+        self._trial_count = 0
+        self._resume_clear = False
         mode = self._load_text(MODE_PATH, "casual").lower()
         if mode not in ("casual", "pro", "spam"):
             mode = "casual"
@@ -142,7 +164,7 @@ class AutotypeApp:
             threading.Thread(target=self._load, daemon=True).start()
             threading.Thread(
                 target=run_capture,
-                args=(self._stop, self._enqueue_frame, self._enqueue_roblox, lambda: self._name),
+                args=(self._stop, self._enqueue_frame, self._enqueue_roblox, lambda: self._name, self._paused.is_set),
                 daemon=True,
             ).start()
             if self.root is not None:
@@ -276,6 +298,10 @@ class AutotypeApp:
         self.arm_btn = tk.Label(actions, text="ARM", bg=CARD, fg=BONE, font=(mono, 12), padx=8, pady=8)
         self.arm_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.arm_btn.bind("<Button-1>", lambda _e: self._toggle_arm())
+        self.pause_btn = tk.Label(actions, text="PAUSE", bg=CARD, fg=BONE, font=(mono, 12), padx=8, pady=8)
+        self.pause_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.pause_btn.bind("<Button-1>", lambda _e: self._toggle_pause())
+        root.bind("<Escape>", lambda _e: self._toggle_pause())
         new_btn = tk.Label(actions, text="NEW GAME", bg=CARD, fg=BONE, font=(mono, 12), padx=8, pady=8)
         new_btn.pack(side="left", fill="x", expand=True)
         new_btn.bind("<Button-1>", lambda _e: self._new_game())
@@ -303,6 +329,9 @@ class AutotypeApp:
         return f"{width}x{height}+{x}+36"
 
     def _put_event(self, kind: str, payload) -> None:
+        # Native button input must interrupt a worker even behind queued frames.
+        if kind == "ACTION" and payload[0] == "PAUSE" and not self._paused.is_set():
+            self._type_cancel.set()
         # Bounded backpressure preserves every turn edge and final word frame.
         while not self._stop.is_set():
             try:
@@ -336,27 +365,25 @@ class AutotypeApp:
             if not self.handle(*payload):
                 self._stop.set()
         elif kind == "SUBMIT":
-            gen, word, input_length = payload
-            if gen == self._gen:
-                try:
-                    if self._current_turn != "ours" or self._roblox != "up" or not roblox_focused():
-                        raise OSError("Roblox lost focus or the turn changed before submission")
-                    # Record and submit on the controller so a capture cannot
-                    # process the acceptance before this word is registered.
-                    self._typed_word = word
-                    self.watch.typed = word
-                    press_enter()
-                except Exception as exc:
-                    self._process_event("TYPE_DONE", (gen, False, input_length, f"Typing failed: {exc}"))
+            gen, word, input_length = payload[:3]
+            if gen == self._gen and not self._paused.is_set() and not self._type_cancel.is_set():
+                after = payload[3] if len(payload) > 3 else time.monotonic()
+                self._verify = (gen, word, input_length, after)
+                self._verify_hits = 0
+                self._verify_board = ""
+                self._verify_read_at = after
+                self._verify_letters = [0] * len(word)
+                self._note(f"Checking {word} before Enter.")
+        elif kind == "TRIAL":
+            gen, word, signal, after = payload
+            if gen == self._gen and not self._paused.is_set():
+                self._trial = (gen, word, signal, after)
+            else:
+                signal.set()
         elif kind == "TYPE_DONE":
             gen, sent, input_length, message = payload
-            # Cancelling bumps the generation, so the worker's completion is
-            # stale. Still drop the prompt latch, or the same turn never retries.
+            # Old workers must never release a newer turn or correction.
             if gen != self._gen:
-                if not sent and not self.typing and not self.watch.typed and not self._typed_word and self.armed:
-                    self.watch.played = ""
-                    if self._typing_prompt:
-                        self._aborted_prompt = self._typing_prompt
                 return
             self._input_length = input_length
             self.typing = False
@@ -364,37 +391,27 @@ class AutotypeApp:
                 self.watch.played = ""
                 self.watch.typed = ""
                 self._typed_word = ""
-                # A partial input needs clearing before another attempt.
+                self._needs_clear = bool(input_length)
+                if self.armed and self._typing_prompt:
+                    self._aborted_prompt = self._typing_prompt
                 if input_length:
-                    self._needs_clear = True
-                    self.armed = False
-                    self._want_arm = False
-                    self._paint_arm()
-                    self._note("Partial input left in Roblox. ARM to clear and retry.")
-                elif self.armed and not (message or "").startswith("Typing failed:"):
-                    if self._typing_prompt:
-                        self._aborted_prompt = self._typing_prompt
+                    self._note("Typing interrupted. Checking the input before retrying.")
             if message:
                 self._note(message)
-                if message.startswith("Typing failed:"):
+                if message.startswith("Typing failed:") and ("Accessibility" in message or "permission" in message.lower()):
                     self._input_problem = message
                     self.armed = False
-                    self._want_arm = False
+                    self._want_arm = True
                     self._aborted_prompt = ""
                     self._paint_arm()
                     self._set_status("KEYBOARD CONTROL ISN'T AVAILABLE")
         elif kind == "ERASED":
             gen, prompt, success = payload
-            if gen == self._gen:
-                self._erasing = False
-                if success and self._current_turn == "ours":
-                    self._needs_clear = False
-                    self.watch.rearm(prompt, time.monotonic())
-                elif not success:
-                    self.armed = False
-                    self._want_arm = False
-                    self._paint_arm()
-                    self._note("Couldn't clear the input. Clear it in Roblox, then ARM.")
+            if gen == self._gen and self._clear:
+                # Sending Backspace is not proof that Roblox deleted anything.
+                self._clear.update(after=time.monotonic(), read_at=0.0, hits=0, board="", working=False)
+                if not success:
+                    self._note("Deletion interrupted. It will resume on your turn.")
 
     def _drain(self) -> None:
         for _ in range(128):
@@ -438,11 +455,13 @@ class AutotypeApp:
             btn.configure(bg=BONE if on else CARD, fg=INK if on else BONE)
 
     def _paint_arm(self) -> None:
+        label = "ENABLE TYPING" if self._input_problem else "ARMED" if self.armed else "ARM"
         if self.face is not None:
             self.face.send("ARMED", "1" if self.armed else "0")
+            self.face.send("ARMLABEL", label)
             return
         self.arm_btn.configure(
-            text="ARMED" if self.armed else "ARM",
+            text=label,
             bg=BONE if self.armed else CARD,
             fg=INK if self.armed else BONE,
         )
@@ -490,6 +509,7 @@ class AutotypeApp:
                 )
                 self.session.set_mode(self._mode)
                 self.session.set_spam_suffixes(self._spam)
+                self.session.new_game()
             self._emit("LOADED", count)
         except Exception as exc:
             self._emit("STATUS", "DICTIONARY FAILED")
@@ -497,13 +517,22 @@ class AutotypeApp:
 
     def _apply_loaded(self, count: int) -> None:
         self._count = count
-        self.ready = True
+        self.ready = count > 0 and self.engine.ready
+        if not self.ready:
+            self._set_status("DICTIONARY IS EMPTY")
+            self._note(f"No words loaded from {DICT_PATH.name}.")
+            return
         self._refresh_used()
         if self._roblox == "up":
             self.armed = self._want_arm
+            if not keyboard_available():
+                self._input_problem = "Allow Accessibility for Python or Terminal in macOS Settings. Then click ENABLE TYPING."
+                self.armed = False
+                self._note(self._input_problem)
             self._paint_arm()
-            self._set_status(f"READY  ·  {count:,} WORDS")
-            self._note("Armed. It reads the tiles and types on your turn.")
+            self._set_status("ALLOW ACCESSIBILITY TO TYPE" if self._input_problem else f"READY  ·  {count:,} WORDS")
+            if self.armed:
+                self._note("Armed. It reads the tiles and types on your turn.")
         elif self._roblox == "hidden":
             self._set_status("ROBLOX ISN'T VISIBLE")
         elif self._roblox == "down":
@@ -512,6 +541,10 @@ class AutotypeApp:
             self._set_status("CAPTURE ISN'T AVAILABLE")
         else:
             self._set_status("LOOKING FOR ROBLOX")
+        if self._last_frame and not self._paused.is_set():
+            self._handle_frame(self._last_frame)
+        if self._paused.is_set():
+            self._set_status("PAUSED  ·  USED WORDS KEPT")
 
     def _apply_roblox(self, status: str) -> None:
         if status == self._roblox:
@@ -541,7 +574,7 @@ class AutotypeApp:
                 self._note("Roblox is open, but its window can't be read." + extra)
             return
         if self.ready and self._want_arm:
-            self.armed = True
+            self.armed = not bool(self._input_problem)
             self._paint_arm()
         if self.ready:
             self._set_status(f"READY  ·  {self._count:,} WORDS")
@@ -551,19 +584,48 @@ class AutotypeApp:
         if self._roblox != "up":
             return
         self._last_frame = dict(frame)
+        if self._paused.is_set():
+            return
         now = time.monotonic()
+        if self._input_problem and keyboard_available():
+            self._input_problem = ""
+            self.armed = self._want_arm and self.ready
+            self._paint_arm()
+            self._resume_clear = self._needs_clear
+            self._note("Keyboard control is available. Resuming.")
         if self.ready and now - self._status_at > 0.3:
             self._status_at = now
             self._set_status("KEYBOARD CONTROL ISN'T AVAILABLE" if self._input_problem
                              else f"READ {frame.get('ms', 0)}ms  ·  {self._count:,} WORDS")
         header = frame.get("header", "")
-        speaker = speaker_from_header(header)
+        speaker = speaker_from_header(header, self._name)
         full = bool(frame.get("full", True))
         board = frame.get("prompt", "")
         whose = ""
         if header_is_turn(header) and speaker:
             ours = header_is_ours(self._name, header) or any(names_match(alias, speaker) for alias in self._aliases)
             whose = "ours" if ours else "theirs"
+        elif (not speaker and self._current_turn == "ours" and board
+              and (not header or header_is_turn(header) or self.typing or self._verify or self._clear
+                   or self._typed_word)):
+            # An unread name does not revoke a turn already identified. Board
+            # acceptance and a readable different speaker still end that turn.
+            whose = "ours"
+        if self._manual_turn:
+            mismatch = speaker and self._name and not (names_match(self._name, speaker)
+                        or any(names_match(alias, speaker) for alias in self._aliases))
+            self._manual_misses = self._manual_misses + 1 if mismatch else 0
+            if self._manual_misses >= 3:
+                self._manual_turn = False
+            else:
+                whose = "ours"
+                if speaker and not self._aliases:
+                    self._name = speaker
+                    self._aliases = {speaker}
+                    if self.face is not None:
+                        self.face.send("NAME", speaker)
+                    else:
+                        self.name_var.set(speaker)
         if whose == "theirs":
             self._theirs_streak += 1
         elif whose == "ours":
@@ -572,10 +634,82 @@ class AutotypeApp:
         # latched, so the turn sat on screen until a key changed the picture.
         if self._header_blip(whose, board) or self._prefix_still_ours(whose, board, full):
             whose = "ours"
+        if (whose == "theirs" and self._typed_word and board == self._typed_word
+                and self._theirs_streak < 3):
+            # One wrong name while the submitted word remains visible is not
+            # acceptance. Keep its Enter acknowledgement alive.
+            whose = "ours"
         self._current_turn = whose
         self._show_turn(whose, header)
         if not self.ready:
             return
+        if self._clear:
+            self._check_clear(frame, whose, now)
+            return
+        if self._resume_clear:
+            if not full or not whose:
+                return
+            self._resume_clear = False
+            old_prefix = self._typing_prompt
+            if whose == "ours" and full and board.startswith(old_prefix) and old_prefix:
+                self._input_length = max(0, len(board) - len(old_prefix))
+                self.watch.played = ""
+                if self._input_length:
+                    self._clear_input(old_prefix)
+                    return
+                self.watch.rearm(old_prefix, now)
+            self._needs_clear = False
+        if (self._needs_clear and self.armed and whose == "ours" and full
+                and not self.typing and not self._erasing and not self._verify):
+            previous_prefix = self._typing_prompt
+            self._needs_clear = False
+            if previous_prefix and board.startswith(previous_prefix):
+                self._input_length = max(0, len(board) - len(previous_prefix))
+                self.watch.played = ""
+                if self._input_length:
+                    self._clear_input(previous_prefix)
+                    return
+                self.watch.rearm(previous_prefix, now)
+        # Choices are useful even if the header is temporarily obscured. They
+        # also make a failed turn read distinguishable from a missing dictionary.
+        prefix = self.watch._prompt(board)
+        if (full and prefix and prefix != self._shown
+                and not self.typing and not self._verify and not self.watch.typed):
+            self._shown = prefix
+            self._retried = ""
+            self._present(prefix)
+        if self._type_cancel.is_set():
+            return
+        self._show_prompt(board or ("—" if full else "READING…"))
+        if self._trial:
+            gen, trial_word, signal, after = self._trial
+            if now - after > 0.4 or gen != self._gen or whose == "theirs":
+                self._trial = None
+                signal.set()
+            elif (whose == "ours" and full and board == trial_word
+                  and frame.get("captured_at", now) >= after and self._trial_count < 2
+                  and not self.engine._is_known_word(trial_word) and roblox_focused()):
+                try:
+                    press_enter()
+                    self._trial_count += 1
+                except Exception as exc:
+                    self._note(f"Couldn't send early Enter: {exc}")
+                self._trial = None
+                signal.set()
+        if self._verify:
+            self._check_submission(frame, whose, now)
+            return
+        if self.typing and not self._typed_word:
+            # These are our own live keystrokes, not a growing new prefix.
+            if whose == "theirs" and self._theirs_streak >= 3:
+                self._needs_clear = bool(self._input_length)
+                self._cancel_typing(release=True)
+                self._note("Turn changed. Typing stopped.")
+            return
+        if self._typed_word:
+            if frame.get("captured_at", now) <= self._submitted_at:
+                return
+            self._check_enter_ack(frame, whose, now)
         error = frame.get("error") or ""
         if rejected_text(error) and self._typed_word and not self._erasing and whose == "ours":
             prompt = self.watch.played or ""
@@ -595,6 +729,9 @@ class AutotypeApp:
                 self.session.commit_play(word)
             self._refresh_used()
             self._note(f"OURS  {word}")
+            self._needs_clear = False
+            self._input_length = 0
+            self._aborted_prompt = ""
         elif event["rejected"] and self._typed_word:
             self._schedule_retry(self._typed_word, used=False)
         prompt = event["play"]
@@ -608,7 +745,6 @@ class AutotypeApp:
                 self._note(f"THEIRS  {kept}")
             elif partials:
                 self._note(f"THEIRS  {max(partials, key=len)}  (couldn't confirm full word)")
-        self._reap_typing()
         # Keep observing while keys are sent so a fast acceptance cannot be lost.
         if self.typing:
             if prompt and prompt != (self._typing_prompt or self.watch.played):
@@ -633,10 +769,10 @@ class AutotypeApp:
             self._start_typing(prompt)
 
     def _show_turn(self, whose: str, header: str) -> None:
-        if not header_is_turn(header):
-            text = "IN LOBBY" if "play" in header.lower() else "WATCHING"
-        elif whose == "ours":
+        if whose == "ours":
             text = "YOUR TURN"
+        elif not header_is_turn(header):
+            text = "IN LOBBY" if "play" in header.lower() else "WATCHING"
         elif whose == "theirs":
             speaker = speaker_from_header(header)
             text = f"THEIR TURN  ·  {speaker.upper()}" if speaker else "THEIR TURN"
@@ -675,7 +811,8 @@ class AutotypeApp:
         self._note(f"{prompt}  →  {word}" if word else f"No word for {prompt}")
 
     def _start_typing(self, prompt: str) -> None:
-        if self.typing or self._erasing:
+        if (self.typing or self._erasing or self._verify or self._needs_clear or self.watch.typed
+                or self._typed_word or self._paused.is_set() or self._input_problem):
             return
         thread = self._typing_thread
         if thread is not None and thread.is_alive():
@@ -683,6 +820,8 @@ class AutotypeApp:
         if self._roblox != "up":
             self._set_status("ROBLOX ISN'T AVAILABLE")
             self._note("ROBLOX ISN'T AVAILABLE")
+            return
+        if time.monotonic() < self._selection_retry_at:
             return
         with self._lock:
             word, suffix, trap, _phase = self.session.choose(prompt)
@@ -694,15 +833,22 @@ class AutotypeApp:
             self.type_var.set(suffix or "—")
             self.trap_var.set(trap or "—")
         if not word or not suffix:
-            self.watch.played = prompt
+            # An empty selection is not a completed attempt and must not latch
+            # this prefix for the rest of the game.
+            self.watch.played = ""
+            self._selection_retry_at = time.monotonic() + 0.3
             self._aborted_prompt = ""
+            self._note(f"No available word for {prompt}; checking again.")
             return
+        self._selection_retry_at = 0.0
         self._aborted_prompt = ""
         self.watch.played = prompt
         self._typed_suffix = suffix
         self.typing = True
         self._typing_prompt = prompt
         self._input_length = 0
+        self._verify_repairs = 0
+        self._trial_count = 0
         self._type_cancel = threading.Event()
         gen = self._gen
         thread = threading.Thread(target=self._type_suffix, args=(gen, word, suffix, self._type_cancel), daemon=True)
@@ -736,20 +882,10 @@ class AutotypeApp:
         current = self.watch.played or self._typing_prompt or self.watch.pending
         return bool(ready and current and ready == current)
 
-    def _reap_typing(self) -> None:
-        thread = self._typing_thread
-        if not self.typing or thread is None or thread.is_alive():
-            return
-        self.typing = False
-        if self.watch.typed or self._typed_word:
-            return
-        self._aborted_prompt = self.watch.played or self._typing_prompt
-        self.watch.played = ""
-
     def _resume_aborted(self, board: str, whose: str) -> None:
         # The prompt was already ours. Type it again without waiting for a new
         # tile change or another two identical reads.
-        if whose != "ours" or not self.armed or self.typing or self._erasing:
+        if whose != "ours" or not self.armed or self.typing or self._erasing or self._needs_clear:
             return
         if self.watch.typed or self._typed_word or not self._aborted_prompt:
             return
@@ -770,6 +906,11 @@ class AutotypeApp:
 
     def _cancel_typing(self, *, release: bool = False) -> None:
         self._type_cancel.set()
+        self._verify = None
+        self._clear = None
+        if self._trial:
+            self._trial[2].set()
+            self._trial = None
         self._gen += 1
         self.typing = False
         self._erasing = False
@@ -783,7 +924,7 @@ class AutotypeApp:
     def _schedule_retry(self, word: str, *, used: bool) -> None:
         if not word or self._erasing or word == self._retried:
             return
-        prompt = self.watch.played or self._shown
+        prompt = self.watch.played or self._typing_prompt or self._shown
         self._retried = word
         self._typed_word = ""
         self.watch.typed = ""
@@ -796,32 +937,115 @@ class AutotypeApp:
         self._note(f"ALREADY USED  {word}" if used else f"REJECTED  {word}")
         self._clear_input(prompt)
 
-    def _clear_input(self, prompt: str) -> None:
+    def _clear_input(self, prompt: str, *, word: str = "") -> None:
+        if self._erasing or self._paused.is_set() or not prompt:
+            return
+        # Invalidate queued completions and wait for any last held key through
+        # the shared input lock before sending deletions.
+        self._cancel_typing()
+        self._resume_clear = False
         self._erasing = True
+        self._needs_clear = True
         gen = self._gen
         cancel = self._type_cancel
-        # Clear the attempted suffix, keeping the game's starting prefix.
-        input_length = self._input_length or len(self._typed_suffix)
+        board = self._last_frame.get("prompt", "")
+        visible = len(board) - len(prompt) if board.startswith(prompt) else 0
+        input_length = max(self._input_length, visible, len(self._typed_suffix))
+        self._clear = {"gen": gen, "prompt": prompt, "word": word, "after": time.monotonic(),
+                       "read_at": 0.0, "board": "", "hits": 0, "working": True}
+        self._erase_suffix(gen, prompt, input_length, cancel)
+
+    def _erase_suffix(self, gen: int, prompt: str, input_length: int, cancel: threading.Event) -> None:
         def work() -> None:
             success = False
             try:
-                if focus_roblox():
-                    for _ in range(input_length):
-                        if gen != self._gen or self._stop.is_set() or cancel.is_set():
-                            return
-                        if not roblox_focused():
-                            return
-                        tap_key("back", "\b", 0.012)
-                        if cancel.wait(0.02):
-                            return
-                    success = True
+                with self._input_lock:
+                    if gen != self._gen or cancel.is_set() or self._stop.is_set():
+                        return
+                    if focus_roblox():
+                        for _ in range(input_length):
+                            if gen != self._gen or self._stop.is_set() or cancel.is_set():
+                                return
+                            if not roblox_focused():
+                                return
+                            tap_key("back", "\b", 0.030)
+                            if cancel.wait(0.020):
+                                return
+                        success = True
             except Exception as exc:
-                self._emit("LOG", f"Couldn't clear input: {exc}")
+                self._emit("TYPE_DONE", (gen, False, input_length, f"Typing failed: {exc}"))
             finally:
                 self._emit("ERASED", (gen, prompt, success))
-        threading.Thread(target=work, daemon=True).start()
+        self._typing_thread = threading.Thread(target=work, daemon=True)
+        self._typing_thread.start()
 
-    def _type_suffix(self, gen: int, word: str, suffix: str, cancel: threading.Event) -> None:
+    def _check_clear(self, frame: dict, whose: str, now: float) -> None:
+        state = self._clear
+        self._show_prompt(frame.get("prompt", "") or "READING…")
+        if whose == "theirs" and self._theirs_streak >= 3:
+            self._cancel_typing(release=True)
+            return
+        if whose != "ours" or state["working"] or not self.armed:
+            return
+        captured = frame.get("captured_at", now)
+        if captured <= state["after"] or captured <= state["read_at"]:
+            return
+        state["read_at"] = captured
+        board = frame.get("prompt", "")
+        full = bool(frame.get("full", True)) and "?" not in board
+        if not full or int(frame.get("tiles", len(board))) != len(board):
+            state["hits"] = 0
+            return
+        state["hits"] = state["hits"] + 1 if board == state["board"] else 1
+        state["board"] = board
+        if state["hits"] < 2:
+            return
+        prompt = state["prompt"]
+        if board == prompt:
+            thread = self._typing_thread
+            if thread is not None and thread.is_alive():
+                return
+            word = state["word"]
+            self._clear = None
+            self._erasing = self._needs_clear = False
+            self._input_length = 0
+            self._aborted_prompt = ""
+            self.watch.rearm(prompt, now)
+            if word and word not in self.engine.used_words and word not in self.engine.rejected_words:
+                self.typing = True
+                self.watch.played = prompt
+                self._typed_suffix = word[len(prompt):]
+                self._typing_thread = threading.Thread(target=self._type_suffix,
+                    args=(self._gen, word, self._typed_suffix, self._type_cancel), kwargs={"repair": True}, daemon=True)
+                self._typing_thread.start()
+            else:
+                self._shown = prompt
+                self._present(prompt)
+                self._start_typing(prompt)
+            return
+        if board.startswith(prompt) and now - state["after"] >= 0.10:
+            # A dropped Backspace left characters behind. Delete only the
+            # remaining suffix, then confirm the prefix again before retyping.
+            state.update(working=True, hits=0, after=now)
+            self._erase_suffix(self._gen, prompt, len(board) - len(prompt), self._type_cancel)
+        elif self.watch._prompt(board) and now - state["after"] >= 0.25:
+            # The game advanced while deletion was pending. Release the old
+            # retry and solve the new, twice-confirmed prompt.
+            self._clear = None
+            self._erasing = self._needs_clear = False
+            self._typed_word = self.watch.typed = ""
+            self._input_length = 0
+            self._aborted_prompt = ""
+            self.watch.rearm(board, now)
+            self._shown = board
+            self._present(board)
+            self._start_typing(board)
+
+    def _type_suffix(self, gen: int, word: str, suffix: str, cancel: threading.Event, *, repair: bool = False) -> None:
+        with self._input_lock:
+            self._type_suffix_keys(gen, word, suffix, cancel, repair=repair)
+
+    def _type_suffix_keys(self, gen: int, word: str, suffix: str, cancel: threading.Event, *, repair: bool = False) -> None:
         sent = False
         input_length = 0
         message = ""
@@ -832,6 +1056,10 @@ class AutotypeApp:
                 message = "Couldn't focus Roblox. Typing will retry on your turn."
                 return
             plan = human_plan(suffix, self._name)
+            if repair:
+                from autotype.featherine import build_plan
+                plan = build_plan(suffix, rhythm="staccato", tempo=0.65, immediate=True, corrections=0)
+                plan.end_pause = 0.035
             previous_hold = 0.0
             for step in plan.steps:
                 if cancel.wait(max(0.0, step.delay - previous_hold)) or gen != self._gen or self._stop.is_set():
@@ -841,24 +1069,208 @@ class AutotypeApp:
                     return
                 # Key holds are included in the plan's interval, rather than
                 # added to it; the first key has no artificial lead-in.
-                tap_key(step.kind, step.key, 0.008)
-                previous_hold = 0.008
+                if step.kind == "enter":
+                    trial_word = word[:-len(suffix)] + step.typed
+                    if not repair and not self.engine._is_known_word(trial_word):
+                        signal = threading.Event()
+                        self._emit("TRIAL", (gen, trial_word, signal, time.monotonic()))
+                        deadline = time.monotonic() + 0.4
+                        while not signal.wait(0.01) and time.monotonic() < deadline:
+                            if cancel.is_set() or gen != self._gen:
+                                return
+                    previous_hold = 0.0
+                    continue
+                tap_key(step.kind, step.key, 0.022)
+                previous_hold = 0.022
                 input_length = len(step.typed)
+                if gen == self._gen:
+                    self._input_length = input_length
             if cancel.wait(plan.end_pause) or gen != self._gen or self._stop.is_set():
                 return
             if not roblox_focused():
                 message = "Roblox lost focus before submission."
                 return
-            self._emit("SUBMIT", (gen, word, input_length))
+            self._emit("SUBMIT", (gen, word, input_length, time.monotonic()))
             sent = True
         except Exception as exc:
             message = f"Typing failed: {exc}"
         finally:
             self._emit("TYPE_DONE", (gen, sent, input_length, message))
 
+    def _check_submission(self, frame: dict, whose: str, now: float) -> None:
+        gen, word, input_length, after = self._verify
+        if gen != self._gen or self._paused.is_set() or self._type_cancel.is_set():
+            return
+        if whose == "theirs" and self._theirs_streak >= 3:
+            self._needs_clear = True
+            self._cancel_typing(release=True)
+            return
+        captured = frame.get("captured_at", now)
+        if whose != "ours" or captured <= after or captured <= self._verify_read_at:
+            return
+        self._verify_read_at = captured
+        board = frame.get("prompt", "")
+        full = bool(frame.get("full", True)) and "?" not in board
+        full = full and int(frame.get("tiles", len(board))) == len(board)
+        # Small tiles may have different unread letters on successive frames.
+        # Combine evidence by position, requiring two readings of EVERY letter
+        # and the exact tile count. A contradictory letter resets the evidence.
+        compatible = (frame.get("row_complete", True) and len(board) == len(word)
+                      and int(frame.get("tiles", len(board))) == len(word)
+                      and all(seen == "?" or seen == wanted for seen, wanted in zip(board, word)))
+        if compatible:
+            for i, char in enumerate(board):
+                if char != "?":
+                    self._verify_letters[i] = min(2, self._verify_letters[i] + 1)
+        else:
+            self._verify_letters = [0] * len(word)
+        if full:
+            self._verify_hits = self._verify_hits + 1 if board == self._verify_board else 1
+            self._verify_board = board
+        else:
+            self._verify_hits = 0
+        verified = compatible and all(hits >= 2 for hits in self._verify_letters)
+        if verified:
+            if (not self.armed or not self.engine._is_known_word(word)
+                    or word in self.engine.used_words or word in self.engine.rejected_words):
+                return
+            if not roblox_focused():
+                focus_roblox()
+                return
+            try:
+                # Register the pending submission before Enter so a fast turn
+                # change can confirm it. Used words are recorded on acceptance.
+                self._typed_word = word
+                self.watch.typed = word
+                self.watch.pending = word
+                press_enter()
+                self._submitted_at = time.monotonic()
+                self._submit_read_at = self._submitted_at
+                self._submit_attempts = 1
+                self._submit_hits = 0
+                self._new_prompt = ""
+                self._new_prompt_hits = 0
+                self._verify = None
+                self._manual_turn = False
+                self._note(f"Entered {word}.")
+            except Exception as exc:
+                self._verify = None
+                self._process_event("TYPE_DONE", (gen, False, input_length, f"Typing failed: {exc}"))
+            return
+        prefix = self._typing_prompt
+        if not prefix:
+            return
+        if now - after >= 1.2 and (not full or self._verify_repairs >= 2 or not board.startswith(prefix)):
+            # A permanently unreadable long word must not stall the match.
+            # Try a shorter dictionary answer after a verified clear.
+            with self._lock:
+                self.session.unreadable_words.add(word)
+                self.session.unreadable_prefixes.add(prefix)
+            self._note(f"Couldn't confirm {word}. Trying a shorter answer.")
+            self._clear_input(prefix)
+            return
+        if (not full or self._verify_hits < 2 or now - after < 0.25
+                or not board.startswith(prefix) or self._verify_repairs >= 2):
+            return
+        self._verify_repairs += 1
+        # Use the larger of delivered input and visible input: a clipped row
+        # must not leave an unseen tail for the repaired word to be appended to.
+        self._input_length = max(input_length, len(board) - len(prefix))
+        self._note(f"Correcting {board} to {word}.")
+        self._clear_input(prefix, word=word)
+
+    def _check_enter_ack(self, frame: dict, whose: str, now: float) -> None:
+        word = self._typed_word
+        captured = frame.get("captured_at", now)
+        if (whose != "ours" or captured <= self._submit_read_at or not frame.get("full", True)
+                or not self.armed or "?" in frame.get("prompt", "")):
+            return
+        self._submit_read_at = captured
+        board = frame.get("prompt", "")
+        if int(frame.get("tiles", len(board))) != len(board):
+            return
+        if board == word and not rejected_text(frame.get("error", "")):
+            self._submit_hits += 1
+            self._new_prompt_hits = 0
+            if now - self._submitted_at >= 0.6 and self._submit_hits >= 2:
+                if self._submit_attempts >= 3:
+                    # A response the reader cannot recognize must not leave the
+                    # same answer stuck on screen for the rest of the match.
+                    self._note(f"No acceptance for {word}. Trying another answer.")
+                    self._schedule_retry(word, used=False)
+                    return
+                if not roblox_focused():
+                    focus_roblox()
+                    return
+                try:
+                    press_enter()
+                    self._submitted_at = time.monotonic()
+                    self._submit_read_at = self._submitted_at
+                    self._submit_attempts += 1
+                    self._submit_hits = 0
+                    self._note(f"Retrying Enter for {word}.")
+                except Exception as exc:
+                    self._note(f"Couldn't send Enter: {exc}")
+            return
+        self._submit_hits = 0
+        prompt = self.watch._prompt(board)
+        if prompt and prompt != self.watch.played and not word.endswith(prompt):
+            self._new_prompt_hits = self._new_prompt_hits + 1 if prompt == self._new_prompt else 1
+            self._new_prompt = prompt
+            if self._new_prompt_hits >= 2 and now - self._submitted_at >= 0.2:
+                # A whole opponent turn can pass between captures. A new stable
+                # prompt on our turn releases the old submitted word.
+                with self._lock:
+                    self.session.commit_play(word)
+                self._typed_word = self.watch.typed = ""
+                self._input_length = 0
+                self._needs_clear = False
+                self._aborted_prompt = ""
+                self.watch.rearm(prompt, now)
+                self._refresh_used()
+                self._note(f"OURS  {word}")
+        else:
+            self._new_prompt_hits = 0
+
+    def _toggle_pause(self) -> None:
+        if not self._paused.is_set():
+            self._paused.set()
+            self._needs_clear = self.typing or self._erasing or self._verify is not None
+            self._cancel_typing(release=True)
+            self._manual_turn = False
+            self._set_status("PAUSED  ·  USED WORDS KEPT")
+            self._note("Paused. Typing and game reading stopped; used words kept.")
+        else:
+            self._paused.clear()
+            self._resume_clear = self._needs_clear
+            if not self.watch.typed:
+                self.watch.played = ""
+            self._set_status("RESUMED  ·  READING CURRENT TURN")
+            self._note("Resumed. Reading the current turn.")
+        label = "RESUME" if self._paused.is_set() else "PAUSE"
+        if self.face is not None:
+            self.face.send("PAUSELABEL", label)
+        else:
+            self.pause_btn.configure(text=label)
+
     def _toggle_arm(self) -> None:
         if not self.ready:
             return
+        if self._paused.is_set():
+            self._note("Paused. Resume to enable typing.")
+            return
+        if not keyboard_available():
+            self._input_problem = "Allow Accessibility for Python or Terminal, then click ENABLE TYPING."
+            self.armed = False
+            self._want_arm = True
+            self._paint_arm()
+            self._set_status("ALLOW ACCESSIBILITY TO TYPE")
+            self._note(self._input_problem)
+            request_keyboard_access()
+            return
+        if self._input_problem:
+            self._input_problem = ""
+            self.armed = False
         if self._roblox != "up" and not self.armed:
             if self._roblox == "hidden":
                 self._set_status("ROBLOX ISN'T VISIBLE")
@@ -871,14 +1283,11 @@ class AutotypeApp:
         self._want_arm = self.armed
         self._paint_arm()
         self._note("Armed." if self.armed else "Disarmed.")
-        if not self.armed and (self.typing or self._erasing):
+        if not self.armed and (self.typing or self._erasing or self._verify):
             self._needs_clear = True
             self._cancel_typing()
         if self.armed and self._needs_clear:
-            if self._current_turn == "ours":
-                self._clear_input(self._typing_prompt)
-            else:
-                self._needs_clear = False
+            self._resume_clear = True
         if self.armed and self._shown and not self.typing and not self.watch.typed:
             self._input_problem = ""
             self.watch.played = ""
@@ -906,7 +1315,7 @@ class AutotypeApp:
         frame = self._last_frame
         if not frame or self._roblox != "up":
             return
-        speaker = speaker_from_header(frame.get("header", ""))
+        speaker = speaker_from_header(frame.get("header", ""), self._name)
         if names_match(self._name, speaker) or speaker in self._aliases:
             prompt = frame.get("prompt", "")
             if self._current_turn != "ours" and self.watch._prompt(prompt) and not self.typing:
@@ -920,18 +1329,42 @@ class AutotypeApp:
         if self._roblox != "up":
             self._note("Roblox must be visible to learn your username.")
             return
-        speaker = speaker_from_header(self._last_frame.get("header", ""))
-        if not speaker:
-            self._note("Waiting for a readable turn username.")
+        if self.typing or self._verify or self._typed_word or self.watch.typed:
+            self._note("The current word is already in progress.")
             return
-        self._name = speaker
-        self._aliases = {speaker}
-        if self.face is not None:
-            self.face.send("NAME", speaker)
+        speaker = speaker_from_header(self._last_frame.get("header", ""))
+        if speaker:
+            self._name = speaker
+            self._aliases = {speaker}
+            if self.face is not None:
+                self.face.send("NAME", speaker)
+            else:
+                self.name_var.set(speaker)
+            self._note(f"YOU  {speaker}  (this session)")
         else:
-            self.name_var.set(speaker)
-        self._note(f"YOU  {speaker}  (this session)")
-        self._recheck_identity()
+            self._note("This turn confirmed manually. Username will be learned when readable.")
+        self._manual_turn = True
+        self._manual_misses = 0
+        if self._paused.is_set():
+            self._note("Paused. Resume to play this turn.")
+            return
+        prompt = self.watch._prompt(self._last_frame.get("prompt", ""))
+        self._current_turn = "ours"
+        self._show_turn("ours", "")
+        board = self._last_frame.get("prompt", "")
+        if (self._needs_clear and self.armed and self._last_frame.get("full", True)
+                and self._typing_prompt and board.startswith(self._typing_prompt)):
+            self._input_length = max(0, len(board) - len(self._typing_prompt))
+            if self._input_length:
+                self._clear_input(self._typing_prompt)
+                return
+            self._needs_clear = False
+        if prompt and self.ready and not self.typing and not self._verify:
+            self.watch.rearm(prompt, time.monotonic())
+            self._shown = prompt
+            self._present(prompt)
+            if self.armed:
+                self._start_typing(prompt)
 
     def _on_spam(self, *_args) -> None:
         self._spam = self.spam_var.get()
@@ -954,6 +1387,9 @@ class AutotypeApp:
         self._shown = ""
         self._aborted_prompt = ""
         self._theirs_streak = 0
+        self._manual_turn = False
+        self._selection_retry_at = 0.0
+        self._submit_hits = self._new_prompt_hits = 0
         with self._lock:
             self.session.new_game()
             self.watch.reset()
@@ -976,6 +1412,8 @@ class AutotypeApp:
             return False
         if key == "ARM":
             self._toggle_arm()
+        elif key == "PAUSE":
+            self._toggle_pause()
         elif key == "CASUAL":
             self._set_mode("casual")
         elif key == "PRO":

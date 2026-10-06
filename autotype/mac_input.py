@@ -69,7 +69,10 @@ def _post(keycode: int, down: bool, flags: int = 0) -> None:
 def tap_key(kind: str, key: str, hold: float = 0.008) -> None:
     if kind == "back":
         _post(_DELETE, True)
-        _post(_DELETE, False)
+        try:
+            time.sleep(max(0.020, hold))
+        finally:
+            _post(_DELETE, False)
         return
     if not key:
         return
@@ -85,12 +88,30 @@ def tap_key(kind: str, key: str, hold: float = 0.008) -> None:
         return
     flags = _FLAG_SHIFT if ch.isalpha() and ch.isupper() else 0
     _post(code, True, flags)
-    time.sleep(hold)
-    _post(code, False, flags)
+    try:
+        time.sleep(max(0.020, hold))
+    finally:
+        _post(code, False, flags)
 
 def press_enter() -> None:
     _post(_RETURN, True)
-    _post(_RETURN, False)
+    try:
+        time.sleep(0.020)
+    finally:
+        _post(_RETURN, False)
+
+def keyboard_available() -> bool:
+    if not hasattr(_CG, "CGPreflightPostEventAccess"):
+        return True
+    _CG.CGPreflightPostEventAccess.restype = ctypes.c_bool
+    return bool(_CG.CGPreflightPostEventAccess())
+
+def request_keyboard_access() -> None:
+    import subprocess
+    if hasattr(_CG, "CGRequestPostEventAccess"):
+        _CG.CGRequestPostEventAccess.restype = ctypes.c_bool
+        _CG.CGRequestPostEventAccess()
+    subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
 
 @lru_cache(maxsize=1)
 def _objc():

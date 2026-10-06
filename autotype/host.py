@@ -82,14 +82,25 @@ def press_enter() -> None:
 
         _mac()
         return
-    _key_event("\n", 0.012)
+    _key_event("\n", 0.020)
 
-def run_capture(stop: threading.Event, on_frame, on_status, name_fn) -> None:
+def keyboard_available() -> bool:
+    if sys.platform == "darwin":
+        from autotype.mac_input import keyboard_available as mac
+        return mac()
+    return sys.platform == "win32" or bool(os.environ.get("DISPLAY"))
+
+def request_keyboard_access() -> None:
+    if sys.platform == "darwin":
+        from autotype.mac_input import request_keyboard_access as mac
+        mac()
+
+def run_capture(stop: threading.Event, on_frame, on_status, name_fn, paused_fn=None) -> None:
 
     try:
         # One reader on every OS. The Mac grabber still uses the native
         # capture helper; letter and header recognition is shared.
-        _run_portable(stop, on_frame, on_status, name_fn)
+        _run_portable(stop, on_frame, on_status, name_fn, paused_fn)
     except (OSError, ImportError, AttributeError) as exc:
         on_status("unsupported")
         on_frame({"prompt": "", "header": "", "tiles": 0, "full": False, "error": str(exc)})
@@ -211,16 +222,22 @@ def _parse_frame(line: str):
         "error": data.get("ERROR", ""),
     }
 
-def _run_portable(stop: threading.Event, on_frame, on_status, name_fn) -> None:
+def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn=None) -> None:
     from autotype.tiles import scan_rgba
 
     last = ""
     while not stop.is_set():
+        if paused_fn and paused_fn():
+            stop.wait(0.025)
+            continue
         if sys.platform not in ("darwin", "win32") and not os.environ.get("DISPLAY"):
             on_status("unsupported" if roblox_running() else "down")
             stop.wait(0.5)
             continue
-        grabbed = _grab()
+        try:
+            grabbed = _grab()
+        except (OSError, RuntimeError, ValueError):
+            grabbed = None
         if grabbed is None:
             status = "hidden" if roblox_running() else "down"
             if status != last:
@@ -231,12 +248,19 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn) -> None:
         if last != "up":
             last = "up"
             on_status("up")
-        raw, width, height = _shrink_rgba(*grabbed)
-        del grabbed
-        started = time.perf_counter()
-        frame = scan_rgba(raw, width, height, name_fn() if name_fn else "")
-        frame["ms"] = int((time.perf_counter() - started) * 1000)
-        on_frame(frame)
+        captured_at = time.monotonic()
+        try:
+            raw, width, height = _shrink_rgba(*grabbed)
+            del grabbed
+            started = time.perf_counter()
+            frame = scan_rgba(raw, width, height, name_fn() if name_fn else "")
+            frame["ms"] = int((time.perf_counter() - started) * 1000)
+            frame["captured_at"] = captured_at
+            on_frame(frame)
+        except (OSError, RuntimeError, ValueError) as exc:
+            # A malformed/transition frame must not kill capture mid-match.
+            on_frame({"prompt": "", "header": "", "tiles": 0, "full": False,
+                      "captured_at": captured_at, "capture_error": str(exc)})
         stop.wait(0.015)
 
 def _grab():

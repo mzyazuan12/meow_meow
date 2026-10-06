@@ -13,7 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from autotype.featherine import human_plan
-from autotype.host import _fit_frame, _parse_frame, _shrink_rgba
+from autotype.host import _fit_frame, _parse_frame, _shrink_rgba, _run_portable
+from autotype import host
 from autotype.session import BoardWatch, MatchSession, header_is_ours, names_match, speaker_from_header
 from dyoe2_engine import Dyoe2Engine, TrapPools
 
@@ -169,8 +170,11 @@ class TurnRegressionTests(unittest.TestCase):
         app.watch.played = 's'
         app.typing = True
         app._current_turn = 'ours'
+        app._typing_prompt = 's'
         with patch.object(app_module, 'roblox_focused', return_value=True), patch.object(app_module, 'press_enter'):
             app._process_event('SUBMIT', (app._gen, 'stone', 4))
+            app._handle_frame(frame('stone'))
+            app._handle_frame(frame('stone'))
         app._handle_frame(frame('e', 'opponent'))
         self.assertEqual(app.engine.used_words, {'stone'})
         self.assertEqual(app.session.round, 2)
@@ -319,10 +323,10 @@ class TypingRegressionTests(unittest.TestCase):
             self.assertEqual(plan.steps[0].delay, 0)
             shown = ''
             for step in plan.steps:
-                shown = shown[:-1] if step.kind == 'back' else shown + step.key
+                shown = shown[:-1] if step.kind == 'back' else shown if step.kind == 'enter' else shown + step.key
                 self.assertEqual(shown, step.typed)
             self.assertEqual(shown, 'nesslerising')
-            self.assertGreater(plan.end_pause, 0.2)
+            self.assertLess(plan.end_pause, 0.1)
             corrected += any(step.kind == 'back' for step in plan.steps)
         self.assertGreater(corrected, 0)
         self.assertLess(corrected, 60)
@@ -354,6 +358,9 @@ class TypingRegressionTests(unittest.TestCase):
             app._type_suffix(app._gen, 'stone', 'tone', Clock())
             while not app._queue.empty():
                 app._process_event(*app._queue.get_nowait())
+            self.assertFalse(any(kind == 'enter' for kind, _ in events))
+            app._handle_frame(frame('stone'))
+            app._handle_frame(frame('stone'))
         self.assertEqual(events[:2], [('wait', 0.0), ('key', 't')])
         self.assertEqual(events[-1][0], 'enter')
 
@@ -372,6 +379,22 @@ class TypingRegressionTests(unittest.TestCase):
 
 
 class CaptureRegressionTests(unittest.TestCase):
+    def test_bad_recognition_frame_does_not_end_capture(self):
+        stop = threading.Event()
+        readings, statuses = [], []
+        def received(reading):
+            readings.append(reading)
+            if len(readings) == 2:
+                stop.set()
+        with patch.object(host, "_grab", return_value=(bytes(10 * 10 * 4), 10, 10)), \
+             patch.object(host.sys, "platform", "darwin"), \
+             patch("autotype.tiles.scan_rgba", side_effect=[ValueError("transition frame"), frame("ism")]):
+            _run_portable(stop, received, statuses.append, lambda: "player")
+        self.assertEqual(statuses, ["up"])
+        self.assertEqual(readings[0]["capture_error"], "transition frame")
+        self.assertFalse(readings[0]["full"])
+        self.assertEqual(readings[1]["prompt"], "ism")
+
     def test_scaling_preserves_aspect_and_bounds_portrait_and_retina_memory(self):
         for width, height in [(1281, 720), (3840, 2160), (1080, 5000), (900, 600)]:
             _, w, h = _fit_frame(width, height)

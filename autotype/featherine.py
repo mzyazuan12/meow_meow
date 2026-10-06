@@ -293,15 +293,39 @@ def live_plan(word: str, rng: Optional[Callable[[], float]] = None) -> AutotypeP
 
 def human_plan(word: str, name: str = "", rng: Optional[Callable[[], float]] = None) -> AutotypePlan:
 
+    random_fn = rng or random.random
     style = typing_style_for_name(name or "player")
-    return build_plan(
+    plan = build_plan(
         word,
         human=True,
         rhythm=style["rhythm"],
-        tempo=style["tempo"],
+        tempo=style["tempo"] * 0.82,
         immediate=True,
-        rng=rng,
+        rng=random_fn,
     )
+    # Short corrections add variation without a long pause at the end.
+    for step in plan.steps[1:]:
+        step.delay = max(0.035, step.delay * 0.84)
+    plan.end_pause = 0.035 + random_fn() * 0.040
+    if len(word) >= 5 and not any(s.kind == "back" for s in plan.steps) and random_fn() < 0.12:
+        at = min(len(plan.steps) - 1, 1 + int(random_fn() * (len(plan.steps) - 1)))
+        before = word[:at]
+        wrong = slip_key(word[at], random_fn)
+        if wrong != word[at]:
+            plan.steps[at:at] = [AutotypeStep(before + wrong, 0.045, "type", wrong),
+                               AutotypeStep(before, 0.12, "back", wrong)]
+    # An occasional early Enter is a request, not a raw key: the controller
+    # permits it only for a clearly read non-dictionary trial on our turn.
+    if random_fn() < 0.10:
+        trials = 0
+        for index in range(len(plan.steps) - 1, 0, -1):
+            if plan.steps[index].kind == "back" and plan.steps[index - 1].kind == "type":
+                previous = plan.steps[index - 1]
+                plan.steps.insert(index, AutotypeStep(previous.typed, 0.025, "enter", "\n"))
+                trials += 1
+                if trials == 2:
+                    break
+    return plan
 
 def featherine_plan(word: str, rng: Optional[Callable[[], float]] = None) -> AutotypePlan:
 

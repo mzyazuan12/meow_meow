@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -11,6 +12,7 @@ from autotype.host import _shrink_rgba
 from autotype.glyphs import _atlas_tiles
 from autotype.session import header_is_ours, header_is_turn, speaker_from_header
 from autotype.tiles import scan_rgba
+from autotype import tiles as tile_reader
 
 _HERE = Path(__file__).resolve().parent
 _TILES = {}
@@ -57,6 +59,26 @@ class GameGlyphTests(unittest.TestCase):
             self.assertEqual(result["prompt"], "qovy", (width, height, w, h, result))
             self.assertTrue(result["full"])
 
+    def test_long_word_with_small_tiles_is_read_in_full(self) -> None:
+        word = "pneumonoultramicroscopic"
+        result = _read(_frame(word, width=1600, height=1000, tile=36))
+        self.assertEqual(result["prompt"], word, result)
+        self.assertEqual(result["tiles"], len(word))
+        self.assertTrue(result["full"])
+
+    def test_uncertain_start_of_long_word_never_becomes_a_complete_tail(self) -> None:
+        word = "pneumonoultramicroscopic"
+        image = _frame(word, width=1600, height=1000, tile=36)
+        original = tile_reader.read_letter
+        left = (1600 - (36 * len(word) + 6 * (len(word) - 1))) // 2
+        def read(rgb, box):
+            return "" if box[0] < left + 6 * 42 else original(rgb, box)
+        with patch.object(tile_reader, "read_letter", side_effect=read):
+            result = _read(image)
+        self.assertEqual(result["prompt"], "?" * 6 + word[6:], result)
+        self.assertEqual(result["tiles"], len(word))
+        self.assertFalse(result["full"])
+
     def test_a_missing_tile_keeps_its_place(self) -> None:
         tile, gap = 80, 10
         image = _frame("qovy", tile=tile)
@@ -68,6 +90,17 @@ class GameGlyphTests(unittest.TestCase):
         result = _read(image)
         self.assertEqual(result["tiles"], 4, result)
         self.assertEqual(result["prompt"], "q?vy", result)
+        self.assertFalse(result["full"])
+
+    def test_a_missing_white_tile_body_does_not_discard_the_word_tail(self) -> None:
+        tile, gap = 80, 10
+        image = _frame("qovy", tile=tile)
+        x = (900 - (tile * 4 + gap * 3)) // 2 + tile + gap
+        y = int(600 * .36)
+        ImageDraw.Draw(image).rectangle((x - 3, y - 3, x + tile + 3, y + tile + 3), fill=(120, 186, 230, 255))
+        result = _read(image)
+        self.assertEqual(result["prompt"], "q?vy", result)
+        self.assertEqual(result["tiles"], 4)
         self.assertFalse(result["full"])
 
     def test_real_header_names_the_speaker_and_ignores_menu_icons(self) -> None:

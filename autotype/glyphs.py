@@ -20,6 +20,7 @@ BIN_PATH = _HERE / "glyphs.bin"
 ATLAS_PATH = _HERE / "glyph_tiles.png"
 ATLAS_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZEBYUAB"
 ATLAS_CELL = 176
+PUNCT_PATH = _HERE / "glyph_punctuation.png"
 
 TILE_WORK = 48
 TILE_GRID = 24
@@ -29,7 +30,8 @@ HEAD_FONTS = ("Montserrat-Black.ttf", "Montserrat-Bold.ttf", "BuilderSans-ExtraB
 # The trailing glyphs of each sample are this text, one character per glyph.
 # Spaces are gaps, not glyphs, so they are not in the string.
 HEADER_SAMPLE_TEXT = "ga2323332,typeanenglishwordstartingwith:"
-HEADER_SAMPLES = ("header_sample.png", "header_sample_small.png")
+HEADER_SAMPLES = ("header_sample.png", "header_sample_small.png", "header_sample_fullscreen.png",
+                  "header_sample_fullscreen_small.png")
 
 TILE_MIN_SCORE = 0.55
 TILE_MIN_MARGIN = 0.02
@@ -128,11 +130,17 @@ def tile_feature(rgb: np.ndarray) -> Optional[np.ndarray]:
     if rgb.shape[0] < 6 or rgb.shape[1] < 6:
         return None
     work = area_resize(ink_of(rgb), TILE_WORK, TILE_WORK)
-    keep = np.zeros(TILE_WORK * TILE_WORK, bool)
-    for pixels, edge in _small_components(work > 0.3, True):
-        if not edge and len(pixels) >= 4:
-            keep[pixels] = True
-    keep = keep.reshape(TILE_WORK, TILE_WORK)
+    # Run components avoid visiting every pixel and all eight neighbors in
+    # Python, especially for animated white shapes that aren't game tiles.
+    from autotype.tiles import label_runs, component_boxes
+    runs, labels, count = label_runs(work > 0.3, eight=True)
+    boxes = component_boxes(runs, labels, count)
+    interior = ((boxes[:, 0] > 0) & (boxes[:, 1] > 0)
+                & (boxes[:, 2] < TILE_WORK) & (boxes[:, 3] < TILE_WORK)
+                & (boxes[:, 4] >= 4))
+    keep = np.zeros((TILE_WORK, TILE_WORK), bool)
+    for y, x0, x1 in runs[interior[labels]].tolist():
+        keep[y, x0:x1] = True
     if not keep.any():
         return None
     fringe = keep.copy()
@@ -173,19 +181,19 @@ class Templates:
         self.tile = tile
         self.head_labels = head_labels
         self.head = head
-        self._tile_index = np.array([ord(c) - 97 for c in tile_labels], np.int64)
         self._tile_letters = sorted(set(tile_labels))
+        self._tile_index = np.array([self._tile_letters.index(c) for c in tile_labels], np.int64)
         self._head_letters = sorted(set(head_labels))
         self._head_index = np.array([self._head_letters.index(c) for c in head_labels], np.int64)
 
     def classify_tile(self, feature: Optional[np.ndarray]) -> Tuple[str, float, float]:
         if feature is None:
             return "", 0.0, 0.0
-        best = np.full(26, -1.0, np.float32)
+        best = np.full(len(self._tile_letters), -1.0, np.float32)
         np.maximum.at(best, self._tile_index, self.tile @ feature)
         order = np.argsort(-best)
         top, second = float(best[order[0]]), float(best[order[1]])
-        return chr(97 + int(order[0])), top, top - second
+        return self._tile_letters[int(order[0])], top, top - second
 
     def classify_head(self, feature: Optional[np.ndarray]) -> Tuple[str, float]:
         if feature is None:
@@ -255,6 +263,10 @@ def _atlas_tiles() -> List[Tuple[str, np.ndarray]]:
         used = ~((cell[..., 0] == 255) & (cell[..., 1] == 0) & (cell[..., 2] == 255))
         ys, xs = np.nonzero(used)
         out.append((letter.lower(), cell[: ys.max() + 1, : xs.max() + 1]))
+    if PUNCT_PATH.is_file():
+        punctuation = np.asarray(Image.open(PUNCT_PATH).convert("RGB"))
+        for index, char in enumerate("-'"):
+            out.append((char, punctuation[:, index * 168:(index + 1) * 168]))
     return out
 
 

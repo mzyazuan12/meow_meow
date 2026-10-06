@@ -64,6 +64,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 @property (nonatomic, strong) NSTextField *typeLabel;
 @property (nonatomic, strong) NSTextField *trapLabel;
 @property (nonatomic, strong) NSButton *armButton;
+@property (nonatomic, strong) NSButton *pauseButton;
 @property (nonatomic, strong) NSButton *confirmButton;
 @property (nonatomic, strong) NSTextView *logView;
 @property (nonatomic) BOOL casual;
@@ -209,9 +210,11 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
         [card addSubview:view];
     }
 
-    self.armButton = [self button:@"ARM" action:@selector(arm:) frame:NSMakeRect(18, 118, 186, 36) bg:cardColor() fg:boneColor()];
-    self.resetButton = [self button:@"NEW GAME" action:@selector(newGame:) frame:NSMakeRect(216, 118, 186, 36) bg:cardColor() fg:boneColor()];
+    self.armButton = [self button:@"ARM" action:@selector(arm:) frame:NSMakeRect(18, 118, 124, 36) bg:cardColor() fg:boneColor()];
+    self.pauseButton = [self button:@"PAUSE" action:@selector(pause:) frame:NSMakeRect(148, 118, 124, 36) bg:cardColor() fg:boneColor()];
+    self.resetButton = [self button:@"NEW GAME" action:@selector(newGame:) frame:NSMakeRect(278, 118, 124, 36) bg:cardColor() fg:boneColor()];
     [root addSubview:self.armButton];
+    [root addSubview:self.pauseButton];
     [root addSubview:self.resetButton];
 
     NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(18, 16, 384, 92)];
@@ -267,6 +270,8 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     else if ([key isEqualToString:@"MODE"]) [self showMode:value];
     else if ([key isEqualToString:@"SPAMTEXT"] && ![self.spamField.stringValue isEqualToString:value]) self.spamField.stringValue = value;
     else if ([key isEqualToString:@"ARMED"]) [self showArmed:[value isEqualToString:@"1"]];
+    else if ([key isEqualToString:@"ARMLABEL"]) styleButton(self.armButton, value, self.armed ? boneColor() : cardColor(), self.armed ? inkColor() : boneColor());
+    else if ([key isEqualToString:@"PAUSELABEL"]) styleButton(self.pauseButton, value, cardColor(), boneColor());
 }
 
 - (void)showPrompt:(NSString *)value {
@@ -304,8 +309,9 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     self.spamField.hidden = !spam;
     if (spam) {
         self.logScroll.frame = NSMakeRect(18, 16, 384, 52);
-        self.armButton.frame = NSMakeRect(18, 76, 186, 36);
-        self.resetButton.frame = NSMakeRect(216, 76, 186, 36);
+        self.armButton.frame = NSMakeRect(18, 76, 124, 36);
+        self.pauseButton.frame = NSMakeRect(148, 76, 124, 36);
+        self.resetButton.frame = NSMakeRect(278, 76, 124, 36);
         self.cardView.frame = NSMakeRect(18, 122, 384, 296);
         self.turnLabel.frame = NSMakeRect(18, 428, 228, 18);
         self.confirmButton.frame = NSMakeRect(250, 424, 152, 26);
@@ -317,8 +323,9 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
         [self.window makeFirstResponder:self.spamField];
     } else {
         self.logScroll.frame = NSMakeRect(18, 16, 384, 92);
-        self.armButton.frame = NSMakeRect(18, 118, 186, 36);
-        self.resetButton.frame = NSMakeRect(216, 118, 186, 36);
+        self.armButton.frame = NSMakeRect(18, 118, 124, 36);
+        self.pauseButton.frame = NSMakeRect(148, 118, 124, 36);
+        self.resetButton.frame = NSMakeRect(278, 118, 124, 36);
         self.cardView.frame = NSMakeRect(18, 168, 384, 296);
         self.turnLabel.frame = NSMakeRect(18, 474, 228, 18);
         self.confirmButton.frame = NSMakeRect(250, 470, 152, 26);
@@ -332,6 +339,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 }
 
 - (void)arm:(id)sender { [self send:@"ARM"]; }
+- (void)pause:(id)sender { [self send:@"PAUSE"]; }
 - (void)casual:(id)sender { [self send:@"CASUAL"]; }
 - (void)pro:(id)sender { [self send:@"PRO"]; }
 - (void)spam:(id)sender { [self send:@"SPAM"]; }

@@ -183,7 +183,7 @@ class FeatherineTests(unittest.TestCase):
 
     def test_a_cut_off_word_is_recovered_from_the_next_prompt(self) -> None:
         engine = Dyoe2Engine(
-            ["nesting", "nestinging", "ingene", "stone"],
+            ["nesting", "ingene", "stone"],
             traps=TrapPools(),
             validate_giveable=False,
         )

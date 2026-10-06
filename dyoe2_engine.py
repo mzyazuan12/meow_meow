@@ -339,6 +339,7 @@ class Dyoe2Engine:
         self.rejected_words: set[str] = set()
         self.casual_mode = True
         self.phase = 1
+        self.trap_phases: tuple[int, ...] = ()
         self.hybrid_suffixes: tuple[str, ...] = ()
 
         self.priority_orders: dict[str, list[str]] = {}
@@ -744,7 +745,7 @@ class Dyoe2Engine:
         return self.default_trap_list(phase, casual=use_casual)
 
     def rotate_for_new_game(
-        self, *, casual: bool | None = None, persist: bool = True
+        self, *, casual: bool | None = None, persist: bool = True, shuffle: bool = False
     ) -> None:
 
         use_casual = self.casual_mode if casual is None else casual
@@ -753,7 +754,16 @@ class Dyoe2Engine:
             rotated: list[list[str]] = []
             for tier in tiers:
                 if len(tier) > 1:
-                    rotated.append(tier[1:] + tier[:1])
+                    if shuffle:
+                        import random
+                        shuffled = list(tier)
+                        random.SystemRandom().shuffle(shuffled)
+                        if shuffled[0] == tier[0]:
+                            offset = random.SystemRandom().randrange(1, len(shuffled))
+                            shuffled[0], shuffled[offset] = shuffled[offset], shuffled[0]
+                        rotated.append(shuffled)
+                    else:
+                        rotated.append(tier[1:] + tier[:1])
                 else:
                     rotated.append(tier)
             self.priority_orders[self.priority_key(use_casual, phase)] = [
@@ -927,6 +937,7 @@ class Dyoe2Engine:
             self.casual_mode,
             self.phase,
             self.hybrid_suffixes,
+            self.trap_phases,
             frozenset(self.used_words),
             frozenset(self.rejected_words),
             lower in self.cancelled_prompts,
@@ -939,7 +950,10 @@ class Dyoe2Engine:
         if self._ranked_cache_key == key and self._ranked_cache:
             ranked = self._ranked_cache
         else:
-            if self.phase == 1:
+            if self.trap_phases and self.phase != 5:
+                traps = merge_prefix_tiers(*(self._trap_list_for_phase(p) for p in self.trap_phases))
+                ranked = self._rank_by_trap_walk(prompt, traps, limit=pool_limit)
+            elif self.phase == 1:
                 candidates = self.prefix_candidates(prompt)
                 order = lambda w: (-len(w), w)
                 ranked = (heapq.nsmallest(pool_limit, candidates, key=order)
@@ -1050,6 +1064,13 @@ class Dyoe2Engine:
                 if suffix and lower.endswith(suffix):
                     return 5, suffix
             for phase in (4, 3, 2):
+                hit = self._best_ending_trap(lower, self.get_ordered_traps(phase))
+                if hit is not None:
+                    return phase, hit
+            return None
+
+        if self.trap_phases:
+            for phase in self.trap_phases:
                 hit = self._best_ending_trap(lower, self.get_ordered_traps(phase))
                 if hit is not None:
                     return phase, hit

@@ -83,13 +83,14 @@ def _component_mask(runs: np.ndarray, box) -> np.ndarray:
 # --- prompt tiles --------------------------------------------------------------
 
 def _white(rgb: np.ndarray) -> np.ndarray:
-    lo = rgb.min(axis=2)
-    hi = rgb.max(axis=2)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    lo = np.minimum(np.minimum(r, g), b)
+    hi = np.maximum(np.maximum(r, g), b)
     return (lo > 198) & ((hi - lo) < 40)
 
 
 def _dark(rgb: np.ndarray) -> np.ndarray:
-    return rgb.max(axis=2) < 150
+    return (rgb[..., 0] < 150) & (rgb[..., 1] < 150) & (rgb[..., 2] < 150)
 
 
 def find_tiles(rgb: np.ndarray) -> List[Box]:
@@ -102,12 +103,11 @@ def find_tiles(rgb: np.ndarray) -> List[Box]:
     band = rgb[y0:y1:step, ::step]
     runs, labels, count = label_runs(_white(band))
     boxes = component_boxes(runs, labels, count)
-    # Tiles are far larger than the header's letter fills, which are also
-    # white and outlined. 4% of the short side clears that text on every
-    # window size and still keeps a tile (they run about 7–20%).
+    # Long words shrink the row. Keep small tiles too; border geometry and
+    # glyph evidence below distinguish them from header letter fills.
     short = min(width, height)
-    min_side = max(8, int(short * 0.04)) // step
-    max_side = max(min_side + 4, int(short * 0.32)) // step
+    min_side = max(12, int(short * 0.015)) // step
+    max_side = max(min_side + 4, int(short * 0.50)) // step
     cand: List[Box] = []
     for bx0, by0, bx1, by1, area in boxes.tolist():
         bw, bh = bx1 - bx0, by1 - by0
@@ -126,7 +126,7 @@ def find_tiles(rgb: np.ndarray) -> List[Box]:
         if _tile_border(dark, box):
             kept.append(box)
     kept.sort()
-    return _best_row(kept, width)
+    return _best_row(kept, width, rgb)
 
 
 def _inside(inner: Box, outer: Box) -> bool:
@@ -148,10 +148,18 @@ def _tile_border(dark: np.ndarray, box: Box) -> bool:
     return bool(ring.size) and ring.mean() >= 0.125
 
 
-def _best_row(tiles: List[Box], width: int) -> List[Box]:
+def _best_row(tiles: List[Box], width: int, rgb: Optional[np.ndarray] = None) -> List[Box]:
     best: List[Box] = []
     best_score = -1.0
     for i, (x, y, w, h) in enumerate(tiles):
+        # Score whole rows, never a more readable suffix of the same row.
+        # Otherwise one uncertain letter near the start can make a long word
+        # appear shorter and trigger a destructive correction.
+        if any(abs((py + ph / 2) - (y + h / 2)) <= h / 2
+               and abs(ph - h) <= h / 2 and abs(pw - w) <= w / 2
+               and -(w / 4) <= x - (px + pw) <= w * 2.6
+               for px, py, pw, ph in tiles[:i]):
+            continue
         row = [(x, y, w, h)]
         last = x + w
         cy = y + h / 2
@@ -161,12 +169,24 @@ def _best_row(tiles: List[Box], width: int) -> List[Box]:
             if abs(nh - h) > h / 2 or abs(nw - w) > w / 2:
                 continue
             gap = nx - last
-            if gap < -(w / 4) or gap > w * 1.05:
+            if gap < -(w / 4) or gap > w * 2.6:
                 break
+            if gap > w * 1.05:
+                # Preserve the slots of up to two missing white tile bodies.
+                # Losing a middle tile must not turn the tail into a new row.
+                pitch = w * 1.125
+                missing = max(1, min(2, round((gap + w) / pitch) - 1))
+                for offset in range(missing):
+                    row.append((round(last + w * 0.125 + offset * pitch), y, w, h))
             row.append((nx, ny, nw, nh))
             last = nx + nw
         centre = (row[0][0] + last) / 2
-        score = len(row) * len(row) * w * h * (1.15 - abs(centre - width / 2) / max(1, width))
+        # Avatar text and controls can form square white components too. A
+        # genuine outlined glyph must support the row before its size counts.
+        readable = sum(bool(read_letter(rgb, box)) for box in row) if rgb is not None else len(row)
+        if not readable:
+            continue
+        score = readable ** 2 * w * h * (readable / len(row)) ** 3 * (1.15 - abs(centre - width / 2) / max(1, width))
         if score > best_score:
             best_score = score
             best = row
@@ -179,18 +199,18 @@ _LETTER_CACHE: "OrderedDict[bytes, str]" = OrderedDict()
 def read_letter(rgb: np.ndarray, box: Box) -> str:
     x, y, w, h = box
     crop = rgb[y:y + h, x:x + w]
-    key = hashlib.blake2b(np.ascontiguousarray(crop[::2, ::2, 0] // 32).tobytes()
+    key = hashlib.blake2b(np.ascontiguousarray(crop).tobytes()
                           + bytes((w & 255, h & 255)), digest_size=12).digest()
     hit = _LETTER_CACHE.get(key)
     if hit is not None:
         _LETTER_CACHE.move_to_end(key)
         return hit
     letter = glyphs.read_tile(crop)
-    # Unread tiles are retried on the next frame rather than remembered.
-    if letter:
-        _LETTER_CACHE[key] = letter
-        if len(_LETTER_CACHE) > 160:
-            _LETTER_CACHE.popitem(last=False)
+    # Any pixel change retries recognition, including an unknown tile. Exact
+    # unchanged crops cannot gain information by repeating classification.
+    _LETTER_CACHE[key] = letter
+    if len(_LETTER_CACHE) > 160:
+        _LETTER_CACHE.popitem(last=False)
     return letter
 
 
@@ -351,5 +371,7 @@ def scan_rgba(raw, width: int, height: int, name: str = "") -> dict:
     row = find_tiles(rgb)
     letters = [read_letter(rgb, box) or "?" for box in row]
     prompt = "".join(letters)
+    clipped = bool(row) and (row[0][0] <= 3 or row[-1][0] + row[-1][2] >= width - 3)
     return {"prompt": prompt, "header": header, "tiles": len(row), "ms": 0,
-            "full": "?" not in prompt}
+            "full": bool(row) and "?" not in prompt and not clipped,
+            "row_complete": bool(row) and not clipped}

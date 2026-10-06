@@ -8,8 +8,8 @@ from dyoe2_engine import Dyoe2Engine
 
 ROUNDS_PER_PHASE = 5
 # OCR can split a username and confuse I/l/1 in the instruction itself.
-_INSTRUCTION_RE = re.compile(r"t[yv]pe\s*an\s*eng[l1i]ish\s*w[o0q]rd", re.I)
-_TURN_RE = re.compile(r"(?:t[yv]pe\s*an\s*eng[l1i]ish\s*w[o0q]rd|starting\s*with)", re.I)
+_INSTRUCTION_RE = re.compile(r"t[yv?]pe\s*a[n?]\s*en[g9?][il1?]{2}s[h?]\s*w[o0q?]rd", re.I)
+_TURN_RE = re.compile(r"(?:t[yv?]pe\s*a[n?]\s*en[g9?][il1?]{2}s[h?]\s*w[o0q?]rd|start[il1?]ng\s*with)", re.I)
 
 def phase_for_round(round_n: int) -> int:
     n = max(1, int(round_n or 1))
@@ -18,7 +18,7 @@ def phase_for_round(round_n: int) -> int:
 def phase_for_prompt(round_n: int, prefix: str) -> int:
     length = len(prefix or "")
     by_len = 1 if length <= 1 else min(4, length)
-    return max(phase_for_round(round_n), by_len)
+    return by_len
 
 def sync_round_to_prefix(round_n: int, prefix: str) -> int:
 
@@ -65,22 +65,35 @@ def names_match(ours: str, seen: str) -> bool:
     return _ocr_distance(a, b) <= max(0.5, max(len(a), len(b)) * 0.26)
 
 
-def speaker_from_header(header: str) -> str:
+def speaker_from_header(header: str, name: str = "") -> str:
     text = header or ""
     match = _INSTRUCTION_RE.search(text)
     if not match:
-        return ""
+        # The second instruction line can survive when the first is misread.
+        match = _TURN_RE.search(text)
+        if not match:
+            return ""
+        text = text[:match.start()].split(",", 1)[0]
+        match = None
     # The name is the last token on the instruction's line. Menu icons sit in
     # front of it, separated by real gaps, so they must not be glued on.
-    head = re.split(r"\n|\|", text[: match.start()])[-1]
-    tokens = re.findall(r"[A-Za-z0-9_]{2,32}", head)
+    head = re.split(r"\n|\|", text[:match.start()] if match else text)[-1]
+    tokens = re.findall(r"[A-Za-z0-9_]{1,32}", head)
     if not tokens:
         return ""
-    return _name_key(tokens[-1])
+    if name:
+        # OCR inserts spaces inside long usernames. Compare joined trailing
+        # tokens with the configured identity without joining menu icons blindly.
+        candidates = [_name_key("".join(tokens[start:])) for start in range(len(tokens))]
+        matches = [joined for joined in candidates if names_match(name, joined)]
+        if matches:
+            return min(matches, key=lambda joined: _ocr_distance(_name_key(name), joined))
+    tokens = [token for token in tokens if len(token) >= 2]
+    return _name_key(tokens[-1]) if tokens else ""
 
 
 def header_is_ours(name: str, header: str) -> bool:
-    return header_is_turn(header) and names_match(name, speaker_from_header(header))
+    return header_is_turn(header) and names_match(name, speaker_from_header(header, name))
 
 
 def already_used_text(text: str) -> bool:
@@ -122,6 +135,8 @@ class BoardWatch:
         self._recovery_pending = False
         self._recovery_given = ""
         self._reject_hits = 0
+        self._reject_since = 0.0
+        self._last_accepted = ""
         self._retry_prompt = ""
         self._clock = 0.0
         self._hold_board = ""
@@ -149,7 +164,7 @@ class BoardWatch:
                 "ending": ""}
 
     def _remember(self, board: str) -> None:
-        if len(board) < 2 or board == self.typed:
+        if len(board) < 2 or board == self.typed or board == self._last_accepted:
             return
         if not self._memory or self._memory[-1] != board:
             self._memory.append(board)
@@ -158,11 +173,11 @@ class BoardWatch:
 
     @staticmethod
     def _prompt(board: str) -> str:
-        return board if board.isalpha() and 1 <= len(board) <= 4 else ""
+        return board if re.fullmatch(r"[a-z'-]{1,4}", board) else ""
 
     def observe(self, board: str, whose: str, *, complete: bool = True,
                 tiles: int = 0, now: float | None = None) -> dict:
-        board = re.sub(r"[^a-z?]", "", (board or "").lower())
+        board = re.sub(r"[^a-z?'\-]", "", (board or "").lower())
         whose = whose if whose in ("ours", "theirs") else ""
         self._clock = now if now is not None else self._clock
         complete = complete and "?" not in board and (not tiles or tiles == len(board))
@@ -179,6 +194,7 @@ class BoardWatch:
             if whose == "theirs" or collapsed:
                 out["accepted"] = True
                 expected = self.typed[-len(prompt):] if prompt else ""
+                self._last_accepted = self.typed
                 self.typed = ""
                 self.played = ""
                 self._await_opponent = True
@@ -195,9 +211,14 @@ class BoardWatch:
                     self.pending = board
                 out.update(board=self.pending, turn=self.turn, partials=[])
                 return out
-            if complete and board == self.played and len(previous_board) > len(board):
+            if complete and board == self.played and (self._reject_hits or len(previous_board) > len(board)):
                 self._reject_hits += 1
-                if self._reject_hits >= 2:
+                if self._reject_hits == 1:
+                    self._reject_since = self._clock
+                # A valid word can end with its own starting prefix. Give the
+                # speaker line time to catch up before treating that as a reset.
+                same_ending = self.typed.endswith(board)
+                if self._reject_hits >= 2 and (not same_ending or self._clock - self._reject_since >= 0.5):
                     out["rejected"] = True
                     self.typed = ""
                     self.played = ""
@@ -238,6 +259,12 @@ class BoardWatch:
 
         if whose != "ours":
             # A blank/unread header is never authority to start typing.
+            out.update(board=self.pending, partials=list(self._last_reads))
+            return out
+
+        if self._await_opponent and prompt == self._given and not self._memory:
+            # The board collapsed before the speaker changed. Repeated captures
+            # of that same ending are still the opponent's starting prefix.
             out.update(board=self.pending, partials=list(self._last_reads))
             return out
 
@@ -293,7 +320,9 @@ class BoardWatch:
             self._candidate_hits = 0
         if not prompt or self.played or self._await_opponent:
             return out
-        if self._retry_prompt and prompt != self._retry_prompt:
+        if self._retry_prompt and prompt != self._retry_prompt and self._retry_prompt.startswith(prompt):
+            # A clipped old prefix is not a new turn. An unrelated stable
+            # prefix must still be allowed after a missed opponent boundary.
             return out
         if prompt == self._candidate:
             self._candidate_hits += 1
@@ -333,6 +362,9 @@ class MatchSession:
         self.last_word = ""
         self.last_suffix = ""
         self.last_trap: Optional[str] = None
+        self.last_prefix = ""
+        self.unreadable_words: set[str] = set()
+        self.unreadable_prefixes: set[str] = set()
 
     def set_casual(self, casual: bool) -> None:
         if self.mode == "spam":
@@ -352,7 +384,7 @@ class MatchSession:
             self.engine.set_hybrid_suffixes(self.spam_suffixes)
             self.engine.set_phase(5)
         else:
-            self.engine.set_phase(phase_for_round(self.round))
+            self.engine.set_phase(phase_for_prompt(self.round, self.last_prefix))
 
     def set_spam_suffixes(self, raw: str) -> None:
         self.spam_suffixes = raw or ""
@@ -363,8 +395,13 @@ class MatchSession:
 
     def new_game(self) -> None:
         self.engine.clear_used()
-        self.engine.rotate_for_new_game(casual=self.casual, persist=True)
+        self.unreadable_words.clear()
+        self.unreadable_prefixes.clear()
+        for casual in (True, False):
+            self.engine.rotate_for_new_game(casual=casual, persist=False, shuffle=True)
         self.round = 1
+        self.last_prefix = ""
+        self.engine.trap_phases = ()
         if self.mode == "spam":
             self.engine.set_hybrid_suffixes(self.spam_suffixes)
             self.engine.set_phase(5)
@@ -404,13 +441,13 @@ class MatchSession:
         """Recover using the longest reading, its tile slots, and both prefixes.
 
         A complete valid reading wins. A clipped reading is completed only when
-        the least missing letters uniquely identify a word; ties stay unresolved.
+        the starting letters and next prefix uniquely identify a word.
         """
-        ending = re.sub(r"[^a-z]", "", (ending or "").lower())
-        given = re.sub(r"[^a-z]", "", (given or "").lower())
+        ending = re.sub(r"[^a-z'\-]", "", (ending or "").lower())
+        given = re.sub(r"[^a-z'\-]", "", (given or "").lower())
         if not 1 <= len(ending) <= 4:
             return ""
-        fragments = {re.sub(r"[^a-z?]", "", str(raw).lower()) for raw in partials or []}
+        fragments = {re.sub(r"[^a-z?'\-]", "", str(raw).lower()) for raw in partials or []}
         fragments = [f for f in fragments if len(f.replace("?", "")) >= 2
                      and f != given and f != ending]
         if not fragments:
@@ -444,8 +481,7 @@ class MatchSession:
                     candidates[word] = gap
             if not candidates:
                 return ""
-            missing = min(candidates.values())
-            best_options = [word for word, gap in candidates.items() if gap == missing]
+            best_options = list(candidates)
             if len(best_options) != 1:
                 return ""
             best = best_options[0]
@@ -468,16 +504,17 @@ class MatchSession:
         return self.note_opponent_word(cleaned)
 
     def prepare(self, prefix: str) -> int:
+        self.last_prefix = prefix
         if self.mode == "spam":
             self.engine.set_casual_mode(True)
             self.engine.set_hybrid_suffixes(self.spam_suffixes)
             if self.engine.phase != 5:
                 self.engine.set_phase(5)
             return 5
-        self.round = sync_round_to_prefix(self.round, prefix)
         phase = phase_for_prompt(self.round, prefix)
         self.engine.set_casual_mode(self.casual)
         self.engine.set_phase(phase)
+        self.engine.trap_phases = (4, 3, 2) if phase < 4 and len(self.engine.used_words) > 5 else ()
         return phase
 
     def choices(self, prefix: str, limit: int = 3) -> list:
@@ -487,7 +524,13 @@ class MatchSession:
         if not prefix:
             return []
         out = []
-        for word in self.engine.ranked_words(prefix, limit=limit):
+        if prefix in self.unreadable_prefixes:
+            ranked = sorted(self.engine.prefix_candidates(prefix), key=lambda word: (len(word), word))
+        else:
+            ranked = self.engine.ranked_words(prefix, limit=limit + len(self.unreadable_words))
+        for word in ranked:
+            if word in self.unreadable_words:
+                continue
             if not word.startswith(prefix) or len(word) <= len(prefix):
                 continue
             if any(ch.isspace() for ch in word):
@@ -529,5 +572,5 @@ class MatchSession:
         self.engine.mark_used(word)
         if match is not None:
             phase, trap = match
-            self.engine.deprioritize_trap(phase, trap, persist=True)
+            self.engine.deprioritize_trap(phase, trap, persist=False)
         self.round += 1
