@@ -359,6 +359,159 @@ def human_plan(word: str, name: str = "", rng: Optional[Callable[[], float]] = N
             step.delay *= scale
     return plan
 
+KEY_HOLD = 0.022
+# Fastest interval between letters, about 13 keys a second including the hold.
+MIN_INTERVAL = 0.055
+FIDGET_CHANCE = 0.22
+TYPO_CHANCE = 0.25
+EARLY_ENTER_CHANCE = 0.08
+FIDGET_SLACK = 1.6
+
+
+def plan_duration(steps: Sequence[AutotypeStep]) -> float:
+    return sum(step.delay for step in steps) + KEY_HOLD * sum(step.kind != "enter" for step in steps)
+
+
+def _fidget(prefix: str, suffix: str, rng: Callable[[], float]) -> List[List[str]]:
+    """Short bursts typed and erased before the answer, like "ism" -> "ismsm"."""
+    bursts = []
+    for _ in range(1 + int(rng() * 3)):
+        style = rng()
+        if style < 0.35 and prefix:
+            # Echo the end of the prompt, as if re-reading it.
+            tail = prefix[-2:] if len(prefix) >= 2 else prefix
+            burst = tail[1:] + tail if rng() < 0.5 else tail
+        elif style < 0.65 and suffix:
+            # A false start of the real answer.
+            burst = suffix[:1 + int(rng() * min(2, len(suffix)))]
+        else:
+            first = (suffix or prefix or "e")[0]
+            burst = first + slip_key(first, rng)
+        bursts.append(burst[:3] or "e")
+    return bursts
+
+
+def turn_plan(suffix: str, prefix: str = "", budget: Optional[float] = None,
+              rng: Optional[Callable[[], float]] = None,
+              is_word: Optional[Callable[[str], bool]] = None) -> AutotypePlan:
+    """Keys for one turn, ending with Enter straight after the last letter.
+
+    The pace stays within human limits. With spare time there is sometimes a
+    fidget before the answer, a corrected typo, or an Enter pressed one to
+    three letters early on a non-word. Extras are dropped, then the pace is
+    raised to its floor, to finish inside ``budget`` seconds.
+    """
+    random_fn = rng or random.random
+    budget = float("inf") if budget is None else max(0.0, budget)
+    base = 0.09 + random_fn() * 0.06
+    # Reading the board already took two captures; this is the rest of a reaction.
+    reaction = 0.03 + random_fn() * 0.12 if budget > 2.5 else random_fn() * 0.04
+
+    def key_gap(ch: str) -> float:
+        delay = base * (0.75 + random_fn() * 0.5)
+        if ch in AWKWARD_LETTERS and random_fn() < 0.4:
+            delay += 0.03 + random_fn() * 0.05
+        return delay
+
+    letters = [key_gap(ch) for ch in suffix]
+    hesitations = {i: 0.15 + random_fn() * 0.25 for i in range(2, len(suffix))
+                   if len(suffix) >= 8 and random_fn() < 0.05}
+    fidget = _fidget(prefix, suffix, random_fn) if suffix and random_fn() < FIDGET_CHANCE else []
+    typo_at = (1 + int(random_fn() * (len(suffix) - 2))
+               if len(suffix) >= 3 and random_fn() < TYPO_CHANCE else -1)
+    typo_style = random_fn()
+    early_at = -1
+    if len(suffix) >= 4 and random_fn() < EARLY_ENTER_CHANCE:
+        at = len(suffix) - 1 - int(random_fn() * 3)
+        if at >= 2 and is_word is not None and not is_word(prefix + suffix[:at]):
+            early_at = at
+
+    def build(scale: float, extras: bool) -> List[AutotypeStep]:
+        steps: List[AutotypeStep] = []
+        pause = reaction
+
+        def push(typed: str, delay: float, kind: str, key: str) -> None:
+            steps.append(AutotypeStep(typed, delay, kind, key))
+
+        if extras:
+            for burst in fidget:
+                for n in range(1, len(burst) + 1):
+                    push(burst[:n], pause if n == 1 else key_gap(burst[n - 1]) * scale, "type", burst[n - 1])
+                    pause = 0.0
+                for n in range(len(burst) - 1, -1, -1):
+                    push(burst[:n], (0.18 + random_fn() * 0.3 if n == len(burst) - 1 else
+                                     0.05 + random_fn() * 0.05), "back", "\b")
+                pause = 0.12 + random_fn() * 0.3
+        shown = ""
+        for i, ch in enumerate(suffix):
+            delay = (pause if i == 0 else letters[i] * scale) + (hesitations.get(i, 0.0) if extras else 0.0)
+            pause = 0.0
+            if extras and i == early_at:
+                push(shown, 0.04 + random_fn() * 0.08, "early", "\n")
+                delay = 0.25 + random_fn() * 0.3
+            if extras and i == typo_at:
+                wrong = slip_key(ch, random_fn)
+                if wrong == ch:
+                    wrong = "e" if ch != "e" else "a"
+                push(shown + wrong, delay, "type", wrong)
+                if typo_style < 0.45 and i + 1 < len(suffix):
+                    # Noticed one letter late.
+                    nxt = suffix[i + 1]
+                    push(shown + wrong + nxt, key_gap(nxt) * scale, "type", nxt)
+                    push(shown + wrong, 0.14 + random_fn() * 0.2, "back", "\b")
+                    push(shown, 0.05 + random_fn() * 0.05, "back", "\b")
+                else:
+                    push(shown, 0.12 + random_fn() * 0.2, "back", "\b")
+                delay = 0.07 + random_fn() * 0.08
+            shown += ch
+            push(shown, delay, "type", ch)
+        push(shown, 0.0 if not steps else 0.01 + random_fn() * 0.03, "enter", "\n")
+        return steps
+
+    steps = build(1.0, True)
+    # Fidgets need real spare time; a typo or early Enter needs a little.
+    slack = FIDGET_SLACK if fidget else 0.6
+    if plan_duration(steps) + slack > budget:
+        steps = build(1.0, False)
+    if plan_duration(steps) > budget and len(suffix) > 1:
+        # Faster, but never beyond the human floor; the word was chosen to fit.
+        fixed = plan_duration(build(0.0, False))
+        natural = max(1e-6, plan_duration(steps) - fixed)
+        steps = build(min(1.0, max(0.0, (budget - fixed) / natural)), False)
+        for step in steps[1:]:
+            if step.kind == "type":
+                step.delay = max(MIN_INTERVAL, step.delay)
+    return AutotypePlan(suffix, True, "turn", base, steps, 0.0)
+
+
+def edit_plan(current: str, target: str, budget: Optional[float] = None,
+              rng: Optional[Callable[[], float]] = None) -> AutotypePlan:
+    """Fewest keys from the typed suffix to another answer, then Enter."""
+    random_fn = rng or random.random
+    common = 0
+    for a, b in zip(current, target):
+        if a != b:
+            break
+        common += 1
+    budget = float("inf") if budget is None else budget
+    steps: List[AutotypeStep] = []
+    pause = 0.15 + random_fn() * 0.2 if budget > 2.0 else 0.05
+    for n in range(len(current) - 1, common - 1, -1):
+        steps.append(AutotypeStep(current[:n], pause, "back", "\b"))
+        pause = 0.045 + random_fn() * 0.04
+    base = 0.08 + random_fn() * 0.05
+    for n in range(common + 1, len(target) + 1):
+        steps.append(AutotypeStep(target[:n], pause, "type", target[n - 1]))
+        pause = base * (0.75 + random_fn() * 0.5)
+    steps.append(AutotypeStep(target, 0.0 if not steps else 0.01 + random_fn() * 0.03, "enter", "\n"))
+    total = plan_duration(steps)
+    if total > budget and len(steps) > 2:
+        scale = max(0.4, budget / total)
+        for step in steps[1:-1]:
+            step.delay = max(0.04, step.delay * scale)
+    return AutotypePlan(target, True, "edit", base, steps, 0.0)
+
+
 def featherine_plan(word: str, rng: Optional[Callable[[], float]] = None) -> AutotypePlan:
 
     return build_plan(word, human=True, rhythm="human", tempo=FEATHERINE_TEMPO, rng=rng)

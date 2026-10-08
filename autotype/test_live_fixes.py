@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from autotype.featherine import AutotypePlan, AutotypeStep, human_plan
+from autotype.featherine import turn_plan
 from autotype.session import BoardWatch, MatchSession, header_is_ours, phase_for_prompt, speaker_from_header
 from autotype.tiles import scan_rgba
 from autotype.test_regressions import app_module, frame, make_app
@@ -46,49 +46,70 @@ class ScreenshotTests(unittest.TestCase):
 
 
 class SubmissionTests(unittest.TestCase):
-    def test_replaying_one_capture_cannot_trigger_enter(self):
-        app, _ = make_app(("stone",))
-        app._name = "player"
-        app._typing_prompt = app.watch.played = "s"
-        app._process_event("SUBMIT", (app._gen, "stone", 4))
-        reading = frame("stone")
-        reading["captured_at"] = time.monotonic()
-        with patch.object(app_module, "press_enter") as enter, patch.object(app_module, "roblox_focused", return_value=True):
-            for _ in range(4):
-                app._handle_frame(reading)
-            enter.assert_not_called()
-            reading = dict(reading, captured_at=time.monotonic())
-            app._handle_frame(reading)
-            enter.assert_called_once()
-
-    def test_changing_unknown_tiles_can_confirm_every_letter_without_stalling(self):
-        app, _ = make_app(("ecaboron",))
+    def test_enter_is_pressed_on_submit_and_long_unreadable_words_are_stored(self):
+        word = "electroencephalographically"
+        app, _ = make_app((word, "enter"))
         app._name = "player"
         app._typing_prompt = app.watch.played = "e"
-        app._process_event("SUBMIT", (app._gen, "ecaboron", 7))
-        with patch.object(app_module, "press_enter") as enter, patch.object(app_module, "roblox_focused", return_value=True):
-            for board in ("e?aboron", "ec?boron", "e?aboron"):
-                app._handle_frame(frame(board, full=False))
-                enter.assert_not_called()
-            app._handle_frame(frame("ec?boron", full=False))
+        with patch.object(app_module, "press_enter") as enter:
+            app._process_event("SUBMIT", (app._gen, word, len(word) - 1))
             enter.assert_called_once()
-            self.assertEqual(app.watch.typed, "ecaboron")
+            self.assertEqual(app.watch.typed, word)
+            for _ in range(3):
+                app._handle_frame(frame("electro?????", full=False))
+            enter.assert_called_once()
+        app._handle_frame(frame("ally", "opponent"))
+        self.assertEqual(app.engine.used_words, {word})
+        self.assertFalse(app._typed_word)
 
-    def test_a_clipped_row_cannot_confirm_the_word_even_if_its_visible_letters_match(self):
+    def test_enter_waits_for_roblox_instead_of_another_app(self):
         app, _ = make_app(("stone",))
         app._name = "player"
         app._typing_prompt = app.watch.played = "s"
-        app._process_event("SUBMIT", (app._gen, "stone", 4))
-        with patch.object(app_module, "press_enter") as enter:
-            for _ in range(3):
-                app._handle_frame(dict(frame("stone", full=False), row_complete=False))
+        with patch.object(app_module, "press_enter") as enter, \
+             patch.object(app_module, "roblox_focused", return_value=False), \
+             patch.object(app_module, "focus_roblox", return_value=False):
+            app._process_event("SUBMIT", (app._gen, "stone", 4))
+            app._handle_frame(frame("stone"))
             enter.assert_not_called()
+        with patch.object(app_module, "press_enter") as enter:
+            app._handle_frame(frame("stone"))
+            enter.assert_called_once()
+
+    def test_already_used_banner_deletes_only_the_extra_letters(self):
+        app, _ = make_app(("ismailisms", "ismailism", "ismy"))
+        app._name = "player"
+        app._typing_prompt = app.watch.played = "ism"
+        with patch.object(app_module, "press_enter"):
+            app._process_event("SUBMIT", (app._gen, "ismailisms", 7))
+        with patch.object(app, "_launch_typing") as launch, patch.object(app, "_clear_input") as clear:
+            app._handle_frame(dict(frame("ismailisms"), alert=True))
+        clear.assert_not_called()
+        prompt, word, plan = launch.call_args[0]
+        self.assertEqual((prompt, word), ("ism", "ismailism"))
+        self.assertEqual([s.kind for s in plan.steps], ["back", "enter"])
+        self.assertIn("ismailisms", app.engine.used_words)
+
+    def test_a_banner_left_over_from_before_enter_is_not_this_answers(self):
+        app, _ = make_app(("ismailisms", "ismailism"))
+        app._name = "player"
+        app._typing_prompt = app.watch.played = "ism"
+        app._last_frame = dict(frame("ismailism"), alert=True)
+        with patch.object(app_module, "press_enter"):
+            app._process_event("SUBMIT", (app._gen, "ismailisms", 7))
+        with patch.object(app, "_launch_typing") as launch:
+            app._handle_frame(dict(frame("ismailisms"), alert=True))
+            launch.assert_not_called()
+            app._handle_frame(frame("ismailisms"))
+            app._handle_frame(dict(frame("ismailisms"), alert=True))
+            launch.assert_called_once()
 
     def test_missed_enter_retries_without_retyping_the_word(self):
         app, _ = make_app(("stone",))
         app._name = "player"
         app._typing_prompt = app.watch.played = "s"
         app.watch.pending = app.watch.typed = app._typed_word = "stone"
+        app._submit_attempts = 1
         app._submitted_at = app._submit_read_at = time.monotonic() - 2
         with patch.object(app_module, "press_enter") as enter, patch.object(app_module, "roblox_focused", return_value=True):
             app._handle_frame(frame("stone"))
@@ -122,67 +143,43 @@ class SubmissionTests(unittest.TestCase):
         app.watch.pending = app.watch.typed = app._typed_word = "stone"
         app._submit_attempts = 2
         app._submitted_at = app._submit_read_at = time.monotonic() - 2
-        with patch.object(app, "_clear_input") as clear, patch.object(app_module, "press_enter") as enter:
+        with patch.object(app, "_launch_typing") as launch, patch.object(app_module, "press_enter") as enter:
             app._handle_frame(frame("stone"))
             app._handle_frame(frame("stone"))
-            clear.assert_called_once_with("s")
+            self.assertEqual(launch.call_args[0][1], "star")
             enter.assert_not_called()
-        self.assertEqual(app.session.choose("s")[0], "star")
+        self.assertIn("stone", app.engine.rejected_words)
         self.assertFalse(app.engine.used_words)
         self.assertTrue(app.armed)
 
-    def test_a_rejected_reset_to_the_original_prefix_retries(self):
+    def test_a_rejected_reset_to_the_original_prefix_types_another_answer(self):
         app, _ = make_app(("stone", "star"))
         app._name = "player"
         app._typing_prompt = app.watch.played = "s"
         app.watch.pending = app.watch.typed = app._typed_word = "stone"
-        with patch.object(app, "_clear_input") as clear:
+        with patch.object(app, "_launch_typing") as launch:
             app._handle_frame(frame("s"))
-            clear.assert_not_called()
+            launch.assert_not_called()
             app._handle_frame(frame("s"))
-            clear.assert_called_once_with("s")
+        prompt, word, plan = launch.call_args[0]
+        self.assertEqual(word, "star")
+        # The board shows only the prefix, so nothing is deleted.
+        self.assertEqual([s.kind for s in plan.steps], ["type"] * 3 + ["enter"])
         self.assertIn("stone", app.engine.rejected_words)
         self.assertNotIn("stone", app.engine.used_words)
 
-    def test_unreadable_long_word_is_preserved_until_readable(self):
-        word = "electroencephalographically"
-        app, _ = make_app((word, "enter", "equal"))
+    def test_a_doubled_key_seen_on_the_board_is_edited_from_what_is_shown(self):
+        app, _ = make_app(("stone", "stones"))
         app._name = "player"
-        app._typing_prompt = app.watch.played = "e"
-        app._typed_suffix = word[1:]
-        app._process_event("SUBMIT", (app._gen, word, len(word) - 1, time.monotonic() - 2))
-        with patch.object(app, "_clear_input") as clear, patch.object(app_module, "press_enter") as enter:
-            app._handle_frame(frame("electro?????", full=False))
-            clear.assert_not_called()
-            enter.assert_not_called()
-        self.assertEqual(app._verify[1], word)
-        self.assertNotIn(word, app.session.unreadable_words)
-        self.assertNotIn(word, app.engine.rejected_words)
-        app.session.new_game()
-        self.assertFalse(app.session.unreadable_words)
-
-    def test_enter_requires_two_fresh_complete_readings_of_exact_word(self):
-        app, _ = make_app(("ecaboron",))
-        app._name = "player"
-        app._typing_prompt = "e"
-        app.watch.played = "e"
-        app._current_turn = "ours"
-        with patch.object(app_module, "press_enter") as enter, patch.object(app_module, "roblox_focused", return_value=True):
-            app._process_event("SUBMIT", (app._gen, "ecaboron", 7))
-            enter.assert_not_called()
-            before = app._verify[3] - 1
-            stale = frame("ecaboron"); stale["captured_at"] = before
-            app._handle_frame(stale); app._handle_frame(stale)
-            app._handle_frame(frame("ecabor?n", full=False))
-            enter.assert_not_called()
-            app._handle_frame(frame("ecaboron"))
-            enter.assert_not_called()
-            app._handle_frame(frame("ecaboron"))
-            enter.assert_called_once()
-            self.assertEqual(app.watch.typed, "ecaboron")
-            self.assertFalse(app.engine.used_words)
-            app._handle_frame(frame("n", "opponent"))
-            self.assertEqual(app.engine.used_words, {"ecaboron"})
+        app._typing_prompt = app.watch.played = "s"
+        app.watch.pending = app.watch.typed = app._typed_word = "stone"
+        app._last_frame = frame("sttone")
+        with patch.object(app, "_launch_typing") as launch:
+            app._schedule_retry("stone", used=False)
+        _prompt, word, plan = launch.call_args[0]
+        self.assertEqual(word, "stones")
+        self.assertEqual(plan.steps[-1].typed, "tones")
+        self.assertEqual(sum(s.kind == "back" for s in plan.steps), 4)
 
     def test_own_growing_input_never_restarts_as_a_longer_prefix(self):
         app, _ = make_app()
@@ -194,140 +191,36 @@ class SubmissionTests(unittest.TestCase):
         app._start_typing.assert_not_called()
         self.assertTrue(app.typing)
 
-    def test_a_dropped_backspace_is_repaired_before_final_enter(self):
+    def test_a_full_typing_turn_presses_enter_once_right_after_the_last_key(self):
         app, _ = make_app(("ecaboron",))
         app._start_typing = app_module.AutotypeApp._start_typing.__get__(app)
         app._name = "player"
         app._current_turn = "ours"
-        board = ["e"]
-        entered = []
-        dropped = [False]
-        lock = threading.Lock()
-        # Duplicate the second suffix letter, then miss its first correction.
-        steps = [AutotypeStep("c", 0, "type", "c"),
-                 AutotypeStep("ca", .04, "type", "a"),
-                 AutotypeStep("caa", .04, "type", "a"),
-                 AutotypeStep("ca", .04, "back", "a")]
-        shown = "ca"
-        for char in "boron":
-            shown += char
-            steps.append(AutotypeStep(shown, .04, "type", char))
-        plan = AutotypePlan("caboron", True, "human", 1, steps, .035)
-        def key(kind, ch, hold):
-            with lock:
-                if kind == "back":
-                    if not dropped[0]:
-                        dropped[0] = True
-                    elif len(board[0]) > 1:
-                        board[0] = board[0][:-1]
-                else:
-                    board[0] += ch
-        def enter():
-            with lock:
-                entered.append(board[0])
-        with patch.object(app_module, "human_plan", return_value=plan), \
-             patch.object(app_module, "focus_roblox", return_value=True), \
-             patch.object(app_module, "roblox_focused", return_value=True), \
-             patch.object(app_module, "tap_key", side_effect=key), \
-             patch.object(app_module, "press_enter", side_effect=enter):
+        keys = []
+        with patch.object(app_module, "tap_key", side_effect=lambda kind, key, hold: keys.append(key)), \
+             patch.object(app_module, "press_enter", side_effect=lambda: keys.append("ENTER")), \
+             patch.object(app_module, "turn_plan", side_effect=lambda s, p, b, is_word=None:
+                          app_module.edit_plan("", s)):
             app._start_typing("e")
-            deadline = time.monotonic() + 4
-            while not entered and time.monotonic() < deadline:
-                while not app._queue.empty():
-                    app._process_event(*app._queue.get_nowait())
-                with lock:
-                    reading = frame(board[0])
-                reading["captured_at"] = time.monotonic()
-                app._handle_frame(reading)
-                time.sleep(.012)
-            app._type_cancel.set()
-            if app._typing_thread:
-                app._typing_thread.join(timeout=1)
-        self.assertTrue(dropped[0])
-        self.assertEqual(entered, ["ecaboron"])
-        self.assertEqual(app._verify_repairs, 1)
+            app._typing_thread.join(timeout=3)
+            while not app._queue.empty():
+                app._process_event(*app._queue.get_nowait())
+        self.assertEqual(keys, list("caboron") + ["ENTER"])
+        self.assertEqual(app.watch.typed, "ecaboron")
 
-    def test_dropped_deletions_do_not_append_another_long_word(self):
-        word = "electroencephalographically"
-        app, _ = make_app((word,))
-        app._start_typing = app_module.AutotypeApp._start_typing.__get__(app)
-        app._name = "player"
-        app._current_turn = "ours"
-        board = ["e"]
-        entered, repair_starts = [], []
-        dropped = [False]
-        lock = threading.Lock()
-        steps = []
-        shown = ""
-        # A dropped correction duplicates the first suffix letter.
-        for kind, char in [("type", "l"), ("type", "l"), ("back", "l")] + [("type", c) for c in word[2:]]:
-            shown = shown[:-1] if kind == "back" else shown + char
-            steps.append(AutotypeStep(shown, 0, kind, char))
-        plan = AutotypePlan(word[1:], True, "human", 1, steps, 0)
-        def key(kind, char, hold):
-            with lock:
-                if kind == "back":
-                    # Drop the planned correction AND the first clear key.
-                    if not dropped[0] or (app._clear and not dropped[1]):
-                        if not dropped[0]:
-                            dropped[0] = True
-                            dropped.append(False)
-                        else:
-                            dropped[1] = True
-                        return
-                    if len(board[0]) > 1:
-                        board[0] = board[0][:-1]
-                else:
-                    if char == "l" and app._verify_repairs and len(board[0]) <= 2:
-                        repair_starts.append(board[0])
-                    board[0] += char
-        with patch.object(app_module, "human_plan", return_value=plan), \
-             patch.object(app_module, "focus_roblox", return_value=True), \
-             patch.object(app_module, "roblox_focused", return_value=True), \
-             patch.object(app_module, "tap_key", side_effect=key), \
-             patch.object(app_module, "press_enter", side_effect=lambda: entered.append(board[0])):
-            app._start_typing("e")
-            deadline = time.monotonic() + 6
-            try:
-                while not entered and time.monotonic() < deadline:
-                    while not app._queue.empty():
-                        app._process_event(*app._queue.get_nowait())
-                    with lock:
-                        reading = frame(board[0])
-                    app._handle_frame(reading)
-                    time.sleep(.008)
-            finally:
-                app._type_cancel.set()
-                if app._typing_thread:
-                    app._typing_thread.join(timeout=1)
-        self.assertEqual(dropped, [True, True])
-        self.assertEqual(repair_starts, ["e"])
-        self.assertEqual(entered, [word])
-        self.assertTrue(app.armed)
-
-    def test_early_enter_is_optional_and_capped_and_valid_trial_is_blocked(self):
-        trial_counts = []
-        for seed in range(100):
-            plan = human_plan("nesslerising", "player", random.Random(seed).random)
-            trial_counts.append(sum(step.kind == "enter" for step in plan.steps))
-        self.assertGreater(sum(trial_counts), 0)
-        self.assertGreater(trial_counts.count(0), 70)
-        self.assertLessEqual(max(trial_counts), 2)
-        app, _ = make_app(("stone",))
-        app._name = "player"
-        app.typing = True
-        with patch.object(app_module, "press_enter") as enter, patch.object(app_module, "roblox_focused", return_value=True):
-            signal = threading.Event()
-            app._process_event("TRIAL", (app._gen, "stone", signal, time.monotonic()))
-            app._handle_frame(frame("stone"))
-            enter.assert_not_called()
-            for _ in range(4):
-                signal = threading.Event()
-                app._process_event("TRIAL", (app._gen, "stovne", signal, time.monotonic()))
-                app._handle_frame(frame("stovne"))
-            self.assertEqual(enter.call_count, 1)
-            self.assertEqual(app._trial_count, 1)
-            self.assertFalse(app.engine.used_words)
+    def test_early_enter_is_occasional_and_never_on_a_word(self):
+        counts = []
+        for seed in range(200):
+            plan = turn_plan("esslerising", "n", 12, random.Random(seed).random, lambda w: False)
+            counts.append(sum(step.kind == "early" for step in plan.steps))
+            self.assertEqual(plan.steps[-1].kind, "enter")
+            self.assertEqual(plan.steps[-1].typed, "esslerising")
+        self.assertGreater(sum(counts), 0)
+        self.assertGreater(counts.count(0), 160)
+        self.assertLessEqual(max(counts), 1)
+        for seed in range(200):
+            plan = turn_plan("esslerising", "n", 12, random.Random(seed).random, lambda w: True)
+            self.assertFalse(any(step.kind == "early" for step in plan.steps))
 
 
 class PauseAndPhaseTests(unittest.TestCase):
@@ -357,10 +250,12 @@ class PauseAndPhaseTests(unittest.TestCase):
         app._cancel_typing(release=True)
         app.watch.played = app._typing_prompt = "ism"
         app._process_event("TYPE_DONE", (old_gen, False, 9, "Roblox lost focus."))
-        app._process_event("SUBMIT", (old_gen, "likeness", 4))
+        with patch.object(app_module, "press_enter") as enter:
+            app._process_event("SUBMIT", (old_gen, "likeness", 4))
+        enter.assert_not_called()
         self.assertEqual(app.watch.played, "ism")
         self.assertFalse(app._aborted_prompt)
-        self.assertIsNone(app._verify)
+        self.assertFalse(app._typed_word)
 
     def test_focus_interruption_keeps_typing_armed_for_automatic_recovery(self):
         app, _ = make_app()
@@ -445,19 +340,20 @@ class PauseAndPhaseTests(unittest.TestCase):
         app.typing = True
         app._input_length = 3
         cancel = app._type_cancel
-        app._process_event("SUBMIT", (app._gen, "star", 3))
         gen = app._gen
-        # Cancellation takes effect before the queued native action is drained.
+        # Cancellation takes effect before the queued native action is drained,
+        # so a worker's SUBMIT already in the queue cannot press Enter.
         app._put_event("ACTION", ("PAUSE", ""))
         self.assertTrue(cancel.is_set())
-        app._process_event(*app._queue.get_nowait())
-        self.assertTrue(app._paused.is_set())
-        self.assertIsNone(app._verify)
-        self.assertEqual(face.values["PAUSELABEL"], "RESUME")
         with patch.object(app_module, "press_enter") as enter:
+            app._process_event("SUBMIT", (gen, "star", 3))
+            app._process_event(*app._queue.get_nowait())
+            self.assertTrue(app._paused.is_set())
+            self.assertEqual(face.values["PAUSELABEL"], "RESUME")
             app._process_event("SUBMIT", (gen, "star", 3))
             app._handle_frame(frame("star"))
             enter.assert_not_called()
+        self.assertFalse(app._typed_word)
         self.assertEqual(app.engine.used_words, {"stone"})
         app._toggle_pause()
         self.assertFalse(app._paused.is_set())
@@ -465,23 +361,26 @@ class PauseAndPhaseTests(unittest.TestCase):
         app._new_game()
         self.assertFalse(app.engine.used_words)
 
-    def test_phase_follows_actual_prefix_and_late_game_uses_all_trap_lengths(self):
+    def test_phase_follows_actual_prefix_and_traps_match_the_next_prompt_length(self):
         traps = TrapPools(casual_2=["xy"], casual_3=["zzz"], casual_4=["tone"])
-        engine = Dyoe2Engine(["atone", "axy", "azzz", "aaaaaaaaaa"], traps, validate_giveable=False)
+        words = ["atone", "axy", "azzz", "aaaaaaaaaa", "xyz", "zzzz", "tones",
+                 "abtone", "abzzz", "abxy"]
+        engine = Dyoe2Engine(words, traps, validate_giveable=False)
         engine.cancelled_prompts.clear()
         session = MatchSession(engine)
         session.round = 100
         self.assertEqual(phase_for_prompt(100, "abc"), 3)
+        # A one-letter prompt hands over one letter; only the stage-change
+        # hedge (two letters) can trap. A 4-letter trap is never mixed in.
         self.assertEqual(session.prepare("a"), 1)
-        self.assertEqual(session.choose("a")[0], "azzz")
-        for i in range(6):
-            engine.mark_used(f"previous{i}")
-        self.assertEqual(session.prepare("a"), 1)
-        self.assertEqual(engine.trap_phases, (4, 3, 2))
-        self.assertEqual(session.choose("a")[0], "atone")
+        self.assertTrue(session.choose("a")[0].endswith("xy"))
+        self.assertEqual(engine.trap_phases, ())
+        # Two letters: the exact two-letter trap, before the three-letter hedge.
+        self.assertEqual(session.choose("ab")[0], "abxy")
+        engine.mark_used("abxy")
+        self.assertEqual(session.choose("ab")[0], "abzzz")
         self.assertEqual(session.prepare("abc"), 3)
         self.assertEqual(session.prepare("abcd"), 4)
-        self.assertEqual(engine.trap_phases, ())
         session.new_game()
         self.assertEqual(engine.phase, 1)
 

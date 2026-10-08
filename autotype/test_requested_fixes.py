@@ -10,7 +10,7 @@ from autotype.glyphs import read_tile
 from autotype.test_ocr import _TILES, _frame
 from autotype.tiles import scan_rgba
 from autotype.session import BoardWatch, MatchSession
-from autotype.featherine import human_plan
+from autotype.featherine import human_plan, turn_plan
 from autotype.test_regressions import make_app, frame, app_module
 from dyoe2_engine import Dyoe2Engine, TrapPools, normalize_hybrid_suffixes
 
@@ -45,21 +45,22 @@ class RequestedFixTests(unittest.TestCase):
         app, _ = make_app(('king',))
         app._name = 'player'
         app._typing_prompt = app.watch.played = 'king'
-        app._process_event('SUBMIT', (app._gen, 'king', 0))
-        with patch.object(app_module, 'press_enter') as enter, patch.object(app_module, 'roblox_focused', return_value=True):
-            app._handle_frame(frame('king'))
-            app._handle_frame(frame('king'))
+        with patch.object(app_module, 'press_enter') as enter:
+            app._process_event('SUBMIT', (app._gen, 'king', 0))
             enter.assert_called_once()
+        plan = turn_plan('', 'king', 5, random.Random(0).random)
+        self.assertEqual([s.kind for s in plan.steps], ['enter'])
 
-    def test_unique_missing_letters_submit_long_answer_without_clearing(self):
+    def test_missing_letters_never_hold_back_enter_or_clear_the_answer(self):
         word = 'electroencephalographically'
         app, _ = make_app((word, 'enter'))
         app._name = 'player'
         app._typing_prompt = app.watch.played = 'e'
-        app._process_event('SUBMIT', (app._gen, word, len(word)-1, time.monotonic()-2))
         reading = word[:8] + '?' + word[9:]
-        with patch.object(app, '_clear_input') as clear, patch.object(app_module, 'press_enter') as enter, patch.object(app_module, 'roblox_focused', return_value=True):
+        with patch.object(app, '_clear_input') as clear, patch.object(app_module, 'press_enter') as enter:
+            app._process_event('SUBMIT', (app._gen, word, len(word)-1))
             app._handle_frame(frame(reading, full=False))
+            app._handle_frame(frame('', full=False))
             app._handle_frame(frame(reading, full=False))
             clear.assert_not_called()
             enter.assert_called_once()
@@ -109,18 +110,6 @@ class RequestedFixTests(unittest.TestCase):
         self.assertEqual(app.engine.used_words, {'stone', 'extraordinarily'})
         app._start_typing.assert_called_with('ily')
 
-    def test_empty_capture_between_letter_evidence_does_not_stall(self):
-        word = 'electroencephalographically'
-        app, _ = make_app((word,))
-        app._name = 'player'
-        app._typing_prompt = app.watch.played = 'e'
-        app._process_event('SUBMIT', (app._gen, word, len(word) - 1))
-        with patch.object(app_module, 'press_enter') as enter, patch.object(app_module, 'roblox_focused', return_value=True):
-            app._handle_frame(frame(word))
-            app._handle_frame(frame('', full=False))
-            app._handle_frame(frame(word))
-            enter.assert_called_once()
-
     def test_clipped_row_is_not_a_reason_to_delete_long_word(self):
         word = 'electroencephalographically'
         app, _ = make_app((word,))
@@ -132,24 +121,14 @@ class RequestedFixTests(unittest.TestCase):
                 app._handle_frame(dict(frame('electro'), row_complete=False))
             clear.assert_not_called()
 
-    def test_repair_limit_cannot_latch_the_turn_forever(self):
-        app, _ = make_app(('stone',))
-        app._name = 'player'
-        app._typing_prompt = app.watch.played = 's'
-        app._verify_repairs = 2
-        app._process_event('SUBMIT', (app._gen, 'stone', 4, time.monotonic() - 2))
-        with patch.object(app, '_clear_input') as clear:
-            app._handle_frame(frame('sttone'))
-            app._handle_frame(frame('sttone'))
-            clear.assert_called_once_with('s', word='stone')
-
-    def test_easy_plural_traps_are_occasional_in_all_modes(self):
+    def test_easy_plural_traps_come_after_harder_ones_until_those_run_out(self):
         pools = TrapPools(casual_3=['abc', 'xyz'], pro_3=['abc', 'xyz'])
-        for mode in ('casual', 'pro', 'spam'):
+        for mode in ('casual', 'pro'):
             s = MatchSession(Dyoe2Engine(['preabc', 'prexyz', 'abcs', 'xyza', 'xyzb'], pools, validate_giveable=False))
             s.set_mode(mode)
             self.assertEqual(s.choose('pre')[0], 'prexyz')
-            s._allow_easy_plural = True
+            # Two hand-overs of xyz have used both of its solves.
+            s.given['xyz'] = 2
             self.assertEqual(s.choose('pre')[0], 'preabc')
 
     def test_trap_counts_exclude_the_word_we_are_about_to_use(self):
@@ -168,8 +147,8 @@ class RequestedFixTests(unittest.TestCase):
         app, _ = make_app(('kingdom',))
         app._name = 'player'
         app._typing_prompt = app.watch.played = 'king'
-        app._process_event('SUBMIT', (app._gen, 'kingdom', 3))
-        with patch.object(app_module, 'press_enter') as enter, patch.object(app_module, 'roblox_focused', return_value=True):
+        with patch.object(app_module, 'press_enter') as enter:
+            app._process_event('SUBMIT', (app._gen, 'kingdom', 3))
             app._handle_frame(frame('gnikdom'))
             app._handle_frame(frame('gnikdom'))
             enter.assert_called_once()
@@ -199,24 +178,7 @@ class RequestedFixTests(unittest.TestCase):
         s.engine.set_words(['t'], validate_giveable=False)
         self.assertEqual(s.choose('t')[0], '')
 
-    def test_long_answer_submits_from_stable_visible_slice(self):
-        word = 'pneumonoultramicroscopicsilicovolcanoconiosis'
-        for clipped in (True, False):
-            app, _ = make_app((word,))
-            app._name = 'player'
-            app._typing_prompt = app.watch.played = 'p'
-            app._process_event('SUBMIT', (app._gen, word, len(word) - 1, time.monotonic() - 1))
-            visible = word[1:-1]
-            reading = dict(frame(visible, full=not clipped), row_clipped=clipped,
-                           row_complete=not clipped)
-            with patch.object(app_module, 'press_enter') as enter, patch.object(app_module, 'roblox_focused', return_value=True):
-                app._handle_frame(reading)
-                enter.assert_not_called()
-                app._handle_frame(reading)
-                enter.assert_called_once()
-                self.assertEqual(app.watch.typed, word)
-
-    def test_longest_word_submits_with_some_unreadable_edge_tiles(self):
+    def test_longest_word_is_entered_and_stored_though_its_tiles_are_clipped(self):
         word = 'taumatawhakatangihangakoauauotamateaturipukakapikimaungahoronukupokaiwhenuakitanatahu'
         image = _frame(word, 1600, 1000, 18)
         reading = scan_rgba(image.tobytes(), *image.size)
@@ -225,13 +187,14 @@ class RequestedFixTests(unittest.TestCase):
         app, _ = make_app((word,))
         app._name = 'player'
         app._typing_prompt = app.watch.played = 't'
-        app._process_event('SUBMIT', (app._gen, word, len(word) - 1, time.monotonic() - 1))
         reading['header'] = frame('t')['header']
-        with patch.object(app_module, 'press_enter') as enter, patch.object(app_module, 'roblox_focused', return_value=True):
+        with patch.object(app_module, 'press_enter') as enter:
+            app._process_event('SUBMIT', (app._gen, word, len(word) - 1))
             app._handle_frame(reading)
-            enter.assert_not_called()
             app._handle_frame(reading)
             enter.assert_called_once()
+        app._handle_frame(frame('ahu', 'opponent'))
+        self.assertIn(word, app.engine.used_words)
 
     def test_no_early_enter_on_short_or_unrelated_partial_row(self):
         app, _ = make_app(('stone',))

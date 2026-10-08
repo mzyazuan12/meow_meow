@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from autotype.featherine import human_plan
+from autotype.featherine import edit_plan, human_plan, turn_plan
 from autotype.host import _fit_frame, _parse_frame, _shrink_rgba, _run_portable
 from autotype import host
 from autotype.session import BoardWatch, MatchSession, header_is_ours, names_match, speaker_from_header
@@ -23,6 +23,11 @@ loader = importlib.machinery.SourceFileLoader('autotype_app_test', str(ROOT / 'a
 spec = importlib.util.spec_from_loader(loader.name, loader)
 app_module = importlib.util.module_from_spec(spec)
 loader.exec_module(app_module)
+# Tests must never send keys to, or focus, whatever app is in front.
+app_module.press_enter = unittest.mock.Mock()
+app_module.tap_key = unittest.mock.Mock()
+app_module.focus_roblox = unittest.mock.Mock(return_value=True)
+app_module.roblox_focused = unittest.mock.Mock(return_value=True)
 
 
 class Face:
@@ -217,9 +222,13 @@ class TurnRegressionTests(unittest.TestCase):
         app, _ = make_app()
         app.watch.played = app._shown = 's'
         app.watch.typed = app._typed_word = 'stone'
-        with patch.object(app, '_clear_input') as clear:
+        with patch.object(app, '_clear_input') as clear, patch.object(app, '_launch_typing') as launch:
             app._schedule_retry('stone', used=False)
-        clear.assert_called_once_with('s')
+        clear.assert_not_called()
+        prompt, word, plan = launch.call_args[0]
+        self.assertEqual((prompt, word), ('s', 'star'))
+        # "tone" becomes "tar": three Backspaces, two letters, Enter.
+        self.assertEqual([step.kind for step in plan.steps], ['back'] * 3 + ['type'] * 2 + ['enter'])
         self.assertIn('stone', app.engine.rejected_words)
         self.assertNotIn('stone', app.engine.used_words)
         self.assertFalse(app._typed_word)
@@ -337,14 +346,15 @@ class TypingRegressionTests(unittest.TestCase):
         cancel = threading.Event()
         cancel.set()
         with patch.object(app_module, 'tap_key') as tap, patch.object(app_module, 'press_enter') as enter:
-            app._type_suffix(app._gen, 'stone', 'tone', cancel)
+            app._type_suffix(app._gen, 'stone', edit_plan('', 'tone'), cancel)
         tap.assert_not_called()
         enter.assert_not_called()
 
-    def test_first_key_arrives_before_any_pause(self):
+    def test_enter_follows_the_last_letter_without_reading_the_board(self):
         app, _ = make_app()
         app._name = 'player'
         app._current_turn = 'ours'
+        app._typing_prompt = app.watch.played = 's'
         events = []
         class Clock:
             def is_set(self): return False
@@ -355,14 +365,18 @@ class TypingRegressionTests(unittest.TestCase):
              patch.object(app_module, 'roblox_focused', return_value=True), \
              patch.object(app_module, 'tap_key', side_effect=lambda kind, key, hold: events.append(('key', key))), \
              patch.object(app_module, 'press_enter', side_effect=lambda: events.append(('enter', None))):
-            app._type_suffix(app._gen, 'stone', 'tone', Clock())
+            plan = turn_plan('tone', 's', 10, rng=random.Random(1).random)
+            app._type_suffix(app._gen, 'stone', plan, Clock())
             while not app._queue.empty():
                 app._process_event(*app._queue.get_nowait())
-            self.assertFalse(any(kind == 'enter' for kind, _ in events))
-            app._handle_frame(frame('stone'))
-            app._handle_frame(frame('stone'))
-        self.assertEqual(events[:2], [('wait', 0.0), ('key', 't')])
+        self.assertEqual(events[0][0], 'wait')
+        self.assertLessEqual(events[0][1], 0.15)
         self.assertEqual(events[-1][0], 'enter')
+        # Enter comes straight after the last letter.
+        self.assertEqual(events[-3], ('key', 'e'))
+        self.assertEqual(events[-2][0], 'wait')
+        self.assertLessEqual(events[-2][1], 0.05)
+        self.assertEqual(app._typed_word, 'stone')
 
     def test_focus_loss_prevents_the_next_key_and_enter(self):
         app, _ = make_app()
@@ -373,7 +387,7 @@ class TypingRegressionTests(unittest.TestCase):
         with patch.object(app_module, 'focus_roblox', return_value=True), \
              patch.object(app_module, 'roblox_focused', side_effect=[True, False]), \
              patch.object(app_module, 'tap_key') as tap, patch.object(app_module, 'press_enter') as enter:
-            app._type_suffix(app._gen, 'stone', 'tone', Clock())
+            app._type_suffix(app._gen, 'stone', edit_plan('', 'tone'), Clock())
         self.assertEqual(tap.call_count, 1)
         enter.assert_not_called()
 

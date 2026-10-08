@@ -357,6 +357,32 @@ def finished_word(previous: str, current: str) -> Optional[str]:
         return prev
     return None
 
+PHASE1_MAX_SUFFIX = 14
+MAX_SUFFIX = 30
+# Seconds per typed letter assumed when fitting an answer into the turn clock,
+# including reaction time; human pace, not the fastest the keys can go.
+SECONDS_PER_LETTER = 0.18
+GIVEN_WEIGHT = 3
+PUNCTUATION_BONUS = 2
+EASY_PLURAL_PENALTY = 3
+
+
+def max_suffix_for(time_left: Optional[float], phase: int) -> int:
+    cap = MAX_SUFFIX if time_left is None else int((time_left - 1.0) / SECONDS_PER_LETTER)
+    cap = max(2, min(MAX_SUFFIX, cap))
+    return min(cap, PHASE1_MAX_SUFFIX) if phase == 1 else cap
+
+
+def edit_cost(current: str, target: str) -> Tuple[int, int]:
+    """Backspaces and letters needed to turn the typed word into another."""
+    common = 0
+    for a, b in zip(current, target):
+        if a != b:
+            break
+        common += 1
+    return len(current) - common, len(target) - common
+
+
 class MatchSession:
     def __init__(self, engine: Dyoe2Engine) -> None:
         self.engine = engine
@@ -369,9 +395,14 @@ class MatchSession:
         self.last_suffix = ""
         self.last_trap: Optional[str] = None
         self.last_prefix = ""
-        self._allow_easy_plural = False
+        # How many times each prefix was handed to an opponent this game.
+        self.given: dict[str, int] = {}
+        self._given_word = ""
+        self._given_key = ""
         self._choice_cache_key = None
         self._choice_cache: list[str] = []
+        self._choice_traps: dict[str, str] = {}
+        self._total_cache: dict[str, int] = {}
         self.unreadable_words: set[str] = set()
         self.unreadable_prefixes: set[str] = set()
 
@@ -419,7 +450,8 @@ class MatchSession:
         self.last_word = ""
         self.last_suffix = ""
         self.last_trap = None
-        self._allow_easy_plural = False
+        self.given = {}
+        self._given_word = self._given_key = ""
         self._choice_cache_key = None
         self._choice_cache = []
 
@@ -537,7 +569,7 @@ class MatchSession:
         phase = phase_for_prompt(self.round, prefix)
         self.engine.set_casual_mode(self.casual)
         self.engine.set_phase(phase)
-        self.engine.trap_phases = (4, 3, 2) if phase < 4 and len(self.engine.used_words) > 5 else ()
+        self.engine.trap_phases = ()
         return phase
 
     def resolve_prefix(self, prefix: str) -> str:
@@ -549,67 +581,147 @@ class MatchSession:
             return reverse
         return prefix
 
-    def choices(self, prefix: str, limit: int = 3) -> list:
+    def _total_solves(self, trap: str) -> int:
+        """Dictionary answers for a prefix, used or not."""
+        if trap not in self._total_cache:
+            start = bisect_left(self.engine.wordlist, trap)
+            stop = bisect_right(self.engine.wordlist, trap + "\uffff")
+            self._total_cache[trap] = sum(len(w) > len(trap) for w in self.engine.wordlist[start:stop])
+        return self._total_cache[trap]
+
+    def _trap_pool(self, length: int) -> dict[str, int]:
+        """DYOE2's trap sources for one prefix length, in their list order.
+
+        A prefix that starts or ends with - or ' can never be handed over as
+        a prompt, so it is not a trap.
+        """
+        pool = self.engine.get_ordered_traps(length) if 2 <= length <= 4 else []
+        return {t: i for i, t in enumerate(pool)
+                if t[0] not in "-'" and t[-1] not in "-'"}
+
+    def _trap_value(self, trap: str, word: str):
+        """Sort key for handing ``trap`` over with ``word``; None if useless.
+
+        Fewer solves left is better. Each earlier hand-over of the same prefix
+        consumed one of its solves (even ones we never saw typed) and lowers
+        its priority. A prefix that is itself an unused word is answered by
+        pressing Enter. Long solves are harder to finish in time.
+        """
+        engine = self.engine
+        if trap == word or (engine._is_known_word(trap) and engine._is_allowed_word(trap)):
+            return None
+        solves = [w for w in engine.prefix_candidates(trap) if w != word]
+        given = self.given.get(trap, 0)
+        total = self._total_solves(trap) - given - (len(word) > len(trap) and word.startswith(trap))
+        left = min(len(solves), total)
+        if left <= 0:
+            return None
+        value = left + GIVEN_WEIGHT * given
+        if not self.casual and ("-" in trap or "'" in trap):
+            value -= PUNCTUATION_BONUS
+        # Appending s/es to the prompt is an answer anyone finds at once.
+        easy_plural = any(w in (trap + "s", trap + "es") for w in solves)
+        if easy_plural:
+            value += EASY_PLURAL_PENALTY
+        shortest = min(len(w) for w in solves) - len(trap)
+        return (value, easy_plural, -shortest)
+
+    def _spam_ranked(self, prefix: str, cap: int) -> list:
+        ranked = self.engine.ranked_words(prefix, limit=256)
+        fitting = [w for w in ranked if len(w) - len(prefix) <= cap]
+        custom = self.engine.hybrid_suffixes
+        fallback = self.engine._hybrid_fallback_traps()
+        self._choice_traps = {}
+        for word in fitting:
+            trap = next((s for s in custom if word.endswith(s)), None)
+            self._choice_traps[word] = trap or self.engine._best_ending_trap(word, fallback)
+        return fitting
+
+    def choices(self, prefix: str, limit: int = 3, time_left: Optional[float] = None) -> list:
         prefix = self.resolve_prefix(prefix)
         phase = self.prepare(prefix)
         if not prefix:
             return []
-        key = (prefix, self.mode, phase, self._allow_easy_plural,
+        cap = max_suffix_for(time_left, phase)
+        hurry = time_left is not None and time_left < 6.0
+        key = (prefix, self.mode, phase, cap, hurry,
                tuple(sorted(self.engine.used_words)), tuple(sorted(self.engine.rejected_words)),
                id(self.engine.wordlist), self.engine.hybrid_suffixes,
-               self.engine.trap_phases)
+               tuple(sorted(self.given.items())))
         if key == self._choice_cache_key:
             return self._choice_cache[:limit]
-        candidates = self.engine.prefix_candidates(prefix)
-        cancel = set(self.engine.analyze_cancel(prefix).cancel_words)
-        phases = self.engine.trap_phases or ((4, 3, 2) if phase == 5 else (phase,))
-        traps = {t for p in phases for t in self.engine.get_ordered_traps(p)}
         if self.mode == "spam":
-            traps.update(self.engine.hybrid_suffixes)
-        lengths = {len(t) for t in traps}
-        counts = {}
-        self._choice_traps = {}
-        def difficulty(t, played):
-            key = (t, played if played.startswith(t) else "")
-            if key not in counts:
-                solves = self.engine.prefix_candidates(t)
-                solves = [w for w in solves if w != played]
-                # Match the website's easy plural rule: appending s/es to the
-                # prompt, rather than any obscure answer that happens to be plural.
-                plural = sum(w in (t + "s", t + "es") for w in solves)
-                easy = bool(plural) and not self._allow_easy_plural
-                counts[key] = (easy, len(solves), plural / max(1, len(solves)))
-            return counts[key]
-        def score(word):
-            endings = [word[-n:] for n in lengths if len(word) >= n
-                       for t in (word[-n:],) if t in traps
-                       and not (self.engine._is_known_word(t) and t not in self.engine.used_words and t != word)]
-            if endings:
-                trap = min(endings, key=lambda t: (*difficulty(t, word), t))
-                self._choice_traps[word] = trap
-                easy, n, plural = difficulty(trap, word)
-                return (0, easy, n, plural, -len(word), word)
-            return (1 if word in cancel else 2, False, 0, 0, -len(word), word)
-        # Only the displayed choices and the current answer are needed. Avoid
-        # retaining and sorting every answer for one-letter prompts.
-        from heapq import nsmallest
-        ranked = nsmallest(max(12, limit), candidates, key=score)
-        self._choice_traps = {word: self._choice_traps[word] for word in ranked
-                              if word in self._choice_traps}
+            ranked = self._spam_ranked(prefix, cap)
+        else:
+            ranked = self._trap_ranked(prefix, phase, cap, hurry, max(12, limit))
+        if not ranked:
+            # Nothing fits the clock: the shortest answers are the best chance.
+            from heapq import nsmallest
+            ranked = nsmallest(max(12, limit), self.engine.prefix_candidates(prefix),
+                               key=lambda w: (len(w), w))
+            self._choice_traps = {}
         self._choice_cache_key = key
         self._choice_cache = ranked
         return ranked[:limit]
 
-    def choose(self, prefix: str) -> Tuple[str, str, Optional[str], int]:
+    def _trap_ranked(self, prefix: str, phase: int, cap: int, hurry: bool, size: int) -> list:
+        # The next player's prompt is as long as ours, except at a stage change
+        # where it gains a letter. Exact-length traps come first; the longer
+        # one is a hedge. A single-letter stage can only hedge.
+        exact = len(prefix) if 2 <= len(prefix) <= 4 else 0
+        hedge = len(prefix) + 1 if len(prefix) + 1 <= 4 else 0
+        pools = {n: self._trap_pool(n) for n in (exact, hedge) if n}
+        cancel = set(self.engine.analyze_cancel(prefix).cancel_words) if self.casual else set()
+        values: dict = {}
+        traps: dict[str, str] = {}
+        worst = (float("inf"),)
+
+        def trap_value(trap: str, word: str):
+            k = (trap, word if word.startswith(trap) else "")
+            if k not in values:
+                values[k] = self._trap_value(trap, word)
+            return values[k]
+
+        def ending(word: str, n: int):
+            if not n or len(word) < n:
+                return None, None
+            trap = word[-n:]
+            order = pools[n].get(trap)
+            if order is None:
+                return None, None
+            value = trap_value(trap, word)
+            return (trap, (*value, order)) if value is not None else (None, None)
+
+        def score(word):
+            size_key = len(word) if hurry else -len(word)
+            exact_trap, exact_value = ending(word, exact)
+            hedge_trap, hedge_value = ending(word, hedge)
+            if exact_trap:
+                traps[word] = exact_trap
+                return (0, exact_value, hedge_value or worst, size_key, word)
+            if hedge_trap:
+                traps[word] = hedge_trap
+                return (1, hedge_value, worst, size_key, word)
+            return (2 if word in cancel else 3, worst, worst, size_key, word)
+
+        from heapq import nsmallest
+        candidates = [w for w in self.engine.prefix_candidates(prefix) if len(w) - len(prefix) <= cap]
+        ranked = nsmallest(size, candidates, key=score)
+        self._choice_traps = {w: traps[w] for w in ranked if w in traps}
+        return ranked
+
+    def choose(self, prefix: str, time_left: Optional[float] = None) -> Tuple[str, str, Optional[str], int]:
         prefix = self.resolve_prefix(prefix)
         phase = self.prepare(prefix)
-        ranked = self.choices(prefix, 12)
+        ranked = self.choices(prefix, 12, time_left)
         # The dictionary contains single-letter entries. The game does not
         # accept a lone supplied tile as a completed self-solve.
         self_solve = (len(prefix) >= 2 and self.engine._is_known_word(prefix)
                       and self.engine._is_allowed_word(prefix))
-        if self_solve and (not ranked or random.random() < 0.25):
-            ranked.insert(0, prefix)
+        top_is_trap = bool(ranked) and ranked[0] in self._choice_traps
+        if self_solve and (not ranked or (time_left is not None and time_left < 1.2)
+                           or (not top_is_trap and random.random() < 0.25)):
+            ranked = [prefix] + ranked
         for word in ranked:
             suffix = word[len(prefix):]
             trap = self._choice_traps.get(word)
@@ -618,17 +730,62 @@ class MatchSession:
         self.last_word, self.last_suffix, self.last_trap = "", "", None
         return "", "", None, phase
 
-    def commit_play(self, word: str) -> None:
+    def alternative(self, prefix: str, current: str,
+                    time_left: Optional[float] = None) -> Tuple[str, int, str]:
+        """The unused answer reachable from ``current`` with the fewest keys.
+
+        Returns (word, backspaces, letters to type). "ismailisms" already used
+        becomes "ismailism" by deleting one letter. Among equally short edits
+        the better trap wins.
+        """
+        prefix = self.resolve_prefix(prefix)
+        phase = self.prepare(prefix)
+        cap = max_suffix_for(time_left, phase)
+        ranked = self.choices(prefix, 12, time_left)
+        rank = {w: i for i, w in enumerate(ranked)}
+        options = [w for w in self.engine.prefix_candidates(prefix) if len(w) - len(prefix) <= cap]
+        if len(prefix) >= 2 and self.engine._is_known_word(prefix) and self.engine._is_allowed_word(prefix):
+            options.append(prefix)
+        options = [w for w in options if w != current]
+        if not options:
+            return "", 0, ""
+
+        def key(word):
+            deletes, inserts = edit_cost(current, word)
+            return (deletes + inserts, rank.get(word, len(rank)), -len(word), word)
+
+        best = min(options, key=key)
+        deletes, inserts = edit_cost(current, best)
+        self.last_word, self.last_suffix = best, best[len(prefix):]
+        self.last_trap = self._choice_traps.get(best)
+        return best, deletes, best[len(best) - inserts:]
+
+    def note_given(self, prompt: str) -> None:
+        """The opponent's actual starting prompt after our last word."""
+        prompt = (prompt or "").lower()
+        word = self._given_word
+        if not word or len(prompt) < 2 or not word.endswith(prompt) or len(word) <= len(prompt):
+            return
+        self._given_word = ""
+        if prompt == self._given_key:
+            return
+        if self._given_key and self.given.get(self._given_key):
+            self.given[self._given_key] -= 1
+        self.given[prompt] = self.given.get(prompt, 0) + 1
+        self._given_key = prompt
+        self._choice_cache_key = None
+
+    def commit_play(self, word: str, prefix: str = "") -> None:
         word = (word or "").lower()
         if not word:
             return
-        match = self.engine.matched_trap_for_word(word)
         self.engine.mark_used(word)
-        if match is not None:
-            phase, trap = match
-            self.engine.deprioritize_trap(phase, trap, persist=False)
+        # Until the opponent's prompt is seen, assume it is as long as ours.
+        prefix = prefix or self.last_prefix
+        n = len(prefix) if prefix and word.startswith(prefix) else 0
+        self._given_word, self._given_key = word, ""
+        if 2 <= n < len(word):
+            self._given_key = word[-n:]
+            self.given[self._given_key] = self.given.get(self._given_key, 0) + 1
+        self._choice_cache_key = None
         self.round += 1
-        # Keep a turn's choices stable across repeated screen refreshes. Easy
-        # plural traps are eligible every turn, but get equal priority only
-        # occasionally when stronger nontrivial alternatives exist.
-        self._allow_easy_plural = random.random() < 0.2

@@ -398,6 +398,10 @@ def scan_rgba(raw, width: int, height: int, name: str = "") -> dict:
     letters = [read_letter(rgb, box) or "?" for box in row]
     prompt = "".join(letters)
     clipped = row_is_clipped(rgb, row)
+    from autotype.timer import read_alert, read_clock
+    clock = read_clock(rgb)
     return {"prompt": prompt, "header": header, "tiles": len(row), "ms": 0,
             "full": bool(row) and "?" not in prompt and not clipped,
-            "row_complete": bool(row) and not clipped, "row_clipped": clipped}
+            "row_complete": bool(row) and not clipped, "row_clipped": clipped,
+            "timer": clock["timer"], "timer_frac": clock["timer_frac"],
+            "alert": read_alert(rgb)}
