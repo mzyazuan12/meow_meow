@@ -158,7 +158,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     self.spamField.bezeled = NO;
     self.spamField.drawsBackground = YES;
     self.spamField.focusRingType = NSFocusRingTypeNone;
-    self.spamField.placeholderString = @"endings, commas or spaces";
+    self.spamField.placeholderString = @"[ing][ary] or commas/spaces";
     self.spamField.hidden = YES;
     self.spamField.wantsLayer = YES;
     self.spamField.layer.borderWidth = 1;

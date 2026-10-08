@@ -66,6 +66,27 @@ class GameGlyphTests(unittest.TestCase):
         self.assertEqual(result["tiles"], len(word))
         self.assertTrue(result["full"])
 
+    def test_45_letter_answer_and_cut_off_edge_tiles(self) -> None:
+        word = 'pneumonoultramicroscopicsilicovolcanoconiosis'
+        complete = _read(_frame(word, width=1600, height=1000, tile=24))
+        self.assertEqual(complete['prompt'], word)
+        self.assertTrue(complete['full'])
+        clipped = _read(_frame(word, width=1600, height=1000, tile=30))
+        self.assertFalse(clipped['full'])
+        self.assertFalse(clipped['row_complete'])
+
+    def test_real_outlined_username_behind_prompt_is_not_a_tile_row(self) -> None:
+        foreground = _frame('q', tile=72)
+        background = Image.new('RGBA', foreground.size, (120, 186, 230, 255))
+        with Image.open(_HERE / 'header_sample.png') as header:
+            background.paste(header.convert('RGBA'), (0, 225))
+        x, y = (900 - 72) // 2, int(600 * .36)
+        background.paste(foreground.crop((x - 3, y - 3, x + 75, y + 75)), (x - 3, y - 3))
+        result = _read(background)
+        self.assertEqual(result['prompt'], 'q')
+        self.assertEqual(result['tiles'], 1)
+        self.assertTrue(result['full'])
+
     def test_uncertain_start_of_long_word_never_becomes_a_complete_tail(self) -> None:
         word = "pneumonoultramicroscopic"
         image = _frame(word, width=1600, height=1000, tile=36)

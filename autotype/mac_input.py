@@ -85,7 +85,7 @@ def tap_key(kind: str, key: str, hold: float = 0.008) -> None:
     if code is None:
         code = _EXTRA.get(ch)
     if code is None:
-        return
+        raise ValueError(f"Unsupported typing character: {ch!r}")
     flags = _FLAG_SHIFT if ch.isalpha() and ch.isupper() else 0
     _post(code, True, flags)
     try:

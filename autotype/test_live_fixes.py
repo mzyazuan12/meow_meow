@@ -89,7 +89,7 @@ class SubmissionTests(unittest.TestCase):
         app._name = "player"
         app._typing_prompt = app.watch.played = "s"
         app.watch.pending = app.watch.typed = app._typed_word = "stone"
-        app._submitted_at = app._submit_read_at = time.monotonic() - 1
+        app._submitted_at = app._submit_read_at = time.monotonic() - 2
         with patch.object(app_module, "press_enter") as enter, patch.object(app_module, "roblox_focused", return_value=True):
             app._handle_frame(frame("stone"))
             enter.assert_not_called()
@@ -106,7 +106,7 @@ class SubmissionTests(unittest.TestCase):
         app._name = "player"
         app._typing_prompt = app.watch.played = "s"
         app.watch.pending = app.watch.typed = app._typed_word = "stone"
-        app._submitted_at = app._submit_read_at = time.monotonic() - 1
+        app._submitted_at = app._submit_read_at = time.monotonic() - 2
         with patch.object(app_module, "press_enter") as enter, patch.object(app_module, "roblox_focused", return_value=True):
             app._handle_frame(frame("stone", "misread"))
             self.assertEqual(app._typed_word, "stone")
@@ -120,8 +120,8 @@ class SubmissionTests(unittest.TestCase):
         app._name = "player"
         app._typing_prompt = app.watch.played = "s"
         app.watch.pending = app.watch.typed = app._typed_word = "stone"
-        app._submit_attempts = 3
-        app._submitted_at = app._submit_read_at = time.monotonic() - 1
+        app._submit_attempts = 2
+        app._submitted_at = app._submit_read_at = time.monotonic() - 2
         with patch.object(app, "_clear_input") as clear, patch.object(app_module, "press_enter") as enter:
             app._handle_frame(frame("stone"))
             app._handle_frame(frame("stone"))
@@ -144,7 +144,7 @@ class SubmissionTests(unittest.TestCase):
         self.assertIn("stone", app.engine.rejected_words)
         self.assertNotIn("stone", app.engine.used_words)
 
-    def test_unreadable_long_word_falls_back_to_a_shorter_dictionary_answer(self):
+    def test_unreadable_long_word_is_preserved_until_readable(self):
         word = "electroencephalographically"
         app, _ = make_app((word, "enter", "equal"))
         app._name = "player"
@@ -153,9 +153,10 @@ class SubmissionTests(unittest.TestCase):
         app._process_event("SUBMIT", (app._gen, word, len(word) - 1, time.monotonic() - 2))
         with patch.object(app, "_clear_input") as clear, patch.object(app_module, "press_enter") as enter:
             app._handle_frame(frame("electro?????", full=False))
-            clear.assert_called_once_with("e")
+            clear.assert_not_called()
             enter.assert_not_called()
-        self.assertEqual(app.session.choose("e")[0], "enter")
+        self.assertEqual(app._verify[1], word)
+        self.assertNotIn(word, app.session.unreadable_words)
         self.assertNotIn(word, app.engine.rejected_words)
         app.session.new_game()
         self.assertFalse(app.session.unreadable_words)
@@ -324,8 +325,8 @@ class SubmissionTests(unittest.TestCase):
                 signal = threading.Event()
                 app._process_event("TRIAL", (app._gen, "stovne", signal, time.monotonic()))
                 app._handle_frame(frame("stovne"))
-            self.assertEqual(enter.call_count, 2)
-            self.assertEqual(app._trial_count, 2)
+            self.assertEqual(enter.call_count, 1)
+            self.assertEqual(app._trial_count, 1)
             self.assertFalse(app.engine.used_words)
 
 
@@ -472,7 +473,7 @@ class PauseAndPhaseTests(unittest.TestCase):
         session.round = 100
         self.assertEqual(phase_for_prompt(100, "abc"), 3)
         self.assertEqual(session.prepare("a"), 1)
-        self.assertEqual(session.choose("a")[0], "aaaaaaaaaa")
+        self.assertEqual(session.choose("a")[0], "azzz")
         for i in range(6):
             engine.mark_used(f"previous{i}")
         self.assertEqual(session.prepare("a"), 1)

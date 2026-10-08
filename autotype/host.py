@@ -236,7 +236,7 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn
             continue
         try:
             grabbed = _grab()
-        except (OSError, RuntimeError, ValueError):
+        except Exception:
             grabbed = None
         if grabbed is None:
             status = "hidden" if roblox_running() else "down"
@@ -257,7 +257,7 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn
             frame["ms"] = int((time.perf_counter() - started) * 1000)
             frame["captured_at"] = captured_at
             on_frame(frame)
-        except (OSError, RuntimeError, ValueError) as exc:
+        except Exception as exc:
             # A malformed/transition frame must not kill capture mid-match.
             on_frame({"prompt": "", "header": "", "tiles": 0, "full": False,
                       "captured_at": captured_at, "capture_error": str(exc)})
@@ -406,7 +406,7 @@ def _win_key(ch: str, hold: float) -> None:
     user32 = _win_api()[0]
     vk, shift = _win_vk(ch)
     if vk is None:
-        return
+        raise ValueError(f"Keyboard layout cannot type {ch!r}")
     if shift:
         _win_send(0x10, False)
     _win_send(vk, False)

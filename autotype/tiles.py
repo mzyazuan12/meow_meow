@@ -96,7 +96,7 @@ def _dark(rgb: np.ndarray) -> np.ndarray:
 def find_tiles(rgb: np.ndarray) -> List[Box]:
     """Boxes of the white interiors of the tile row, left to right."""
     height, width = rgb.shape[:2]
-    y0, y1 = int(height * 0.04), int(height * 0.74)
+    y0, y1 = 0, height
     if y1 <= y0 + 8:
         y0, y1 = 0, height
     step = 2 if min(width, height) >= 900 else 1
@@ -363,6 +363,32 @@ def frame_array(raw, width: int, height: int) -> np.ndarray:
     return np.frombuffer(raw, np.uint8, count=width * height * 4).reshape(height, width, 4)[..., :3]
 
 
+def row_is_clipped(rgb: np.ndarray, row: List[Box]) -> bool:
+    if not row:
+        return False
+    width = rgb.shape[1]
+    if row[0][0] <= 3 or row[-1][0] + row[-1][2] >= width - 3:
+        return True
+    # A cut-off edge tile is no longer square, so find_tiles legitimately
+    # excludes it. Look for its remaining white body and border at the expected
+    # row pitch before calling the remaining, fully visible tiles a whole word.
+    pitch = float(np.median([b[0] - a[0] for a, b in zip(row, row[1:])])) if len(row) > 1 else row[0][2] * 1.125
+    dark = None
+    for box, direction in ((row[0], -1), (row[-1], 1)):
+        x, y, w, h = box
+        nx = round(x + direction * pitch)
+        if not (nx < 0 < nx + w or nx < width < nx + w):
+            continue
+        left, right = max(0, nx), min(width, nx + w)
+        partial = rgb[y:y + h, left:right]
+        if partial.size and _white(partial).mean() > 0.45:
+            if dark is None:
+                dark = _dark(rgb)
+            if _tile_border(dark, (left, y, right - left, h)):
+                return True
+    return False
+
+
 def scan_rgba(raw, width: int, height: int, name: str = "") -> dict:
     if width < 8 or height < 8 or len(raw) < width * height * 4:
         return {"prompt": "", "header": "", "tiles": 0, "ms": 0, "full": False}
@@ -371,7 +397,7 @@ def scan_rgba(raw, width: int, height: int, name: str = "") -> dict:
     row = find_tiles(rgb)
     letters = [read_letter(rgb, box) or "?" for box in row]
     prompt = "".join(letters)
-    clipped = bool(row) and (row[0][0] <= 3 or row[-1][0] + row[-1][2] >= width - 3)
+    clipped = row_is_clipped(rgb, row)
     return {"prompt": prompt, "header": header, "tiles": len(row), "ms": 0,
             "full": bool(row) and "?" not in prompt and not clipped,
-            "row_complete": bool(row) and not clipped}
+            "row_complete": bool(row) and not clipped, "row_clipped": clipped}

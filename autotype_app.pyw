@@ -48,6 +48,22 @@ MUTED = "#98958b"
 CARD = "#11110f"
 LINE = "#2c2c28"
 
+
+def visible_word_slice(word: str, observed: str) -> bool:
+    """Whether a partial tile row uniquely fits one place in a longer word."""
+    if not 8 <= len(observed) < len(word):
+        return False
+    if sum(char != "?" for char in observed) < max(8, int(len(observed) * 0.7)):
+        return False
+    matches = 0
+    for offset in range(len(word) - len(observed) + 1):
+        if all(seen == "?" or seen == wanted
+               for seen, wanted in zip(observed, word[offset:])):
+            matches += 1
+            if matches > 1:
+                return False
+    return matches == 1
+
 PANEL_BIN = _ROOT / "autotype" / "llpanel"
 
 class NativeFace:
@@ -108,7 +124,7 @@ class AutotypeApp:
         self._status_at = 0.0
         self._lock = threading.Lock()
         self._input_lock = threading.Lock()
-        self._queue: queue.Queue = queue.Queue(maxsize=128)
+        self._queue: queue.Queue = queue.Queue(maxsize=32)
         self._name = ""
         self._aliases: set[str] = set()
         self._last_frame: dict = {}
@@ -233,7 +249,7 @@ class AutotypeApp:
             self.mode_buttons[mode] = btn
 
         self.spam_frame = tk.Frame(root, bg=INK)
-        tk.Label(self.spam_frame, text="HYBRID SUFFIXES", bg=INK, fg=MUTED, font=(mono, 10)).pack(anchor="w")
+        tk.Label(self.spam_frame, text="ENDINGS: [ing][ary] or commas/spaces", bg=INK, fg=MUTED, font=(mono, 10)).pack(anchor="w")
         self.spam_var = tk.StringVar(value=self._spam)
         self.spam_var.trace_add("write", self._on_spam)
         spam = tk.Entry(
@@ -332,13 +348,36 @@ class AutotypeApp:
         # Native button input must interrupt a worker even behind queued frames.
         if kind == "ACTION" and payload[0] == "PAUSE" and not self._paused.is_set():
             self._type_cancel.set()
-        # Bounded backpressure preserves every turn edge and final word frame.
+        # Keep input/control events moving when recognition briefly outruns
+        # the UI. Prefer discarding a redundant old frame; never discard a
+        # button action, submission, or change of Roblox availability.
         while not self._stop.is_set():
             try:
                 self._queue.put((kind, payload), timeout=0.05)
                 return
             except queue.Full:
-                continue
+                self._drop_queued_frame()
+
+    def _drop_queued_frame(self) -> None:
+        with self._queue.mutex:
+            pending = self._queue.queue
+            frames = [(index, item[1]) for index, item in enumerate(pending)
+                      if item[0] == "FRAME"]
+            if not frames:
+                return
+            def signature(frame):
+                return (frame.get("prompt"), frame.get("header"), frame.get("full"),
+                        frame.get("row_clipped"))
+            counts = {}
+            for _index, frame in frames:
+                sig = signature(frame)
+                counts[sig] = counts.get(sig, 0) + 1
+            redundant = next((index for index, frame in frames
+                              if counts[signature(frame)] > 2), None)
+            victim = frames[0][0] if redundant is None else redundant
+            del pending[victim]
+            self._queue.unfinished_tasks -= 1
+            self._queue.not_full.notify()
 
     def _enqueue_frame(self, frame: dict) -> None:
         self._put_event("FRAME", frame)
@@ -414,14 +453,20 @@ class AutotypeApp:
                     self._note("Deletion interrupted. It will resume on your turn.")
 
     def _drain(self) -> None:
-        for _ in range(128):
-            try:
-                kind, payload = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            self._process_event(kind, payload)
-        if not self._stop.is_set():
-            self.root.after(8, self._drain)
+        try:
+            for _ in range(32):
+                try:
+                    kind, payload = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._process_event(kind, payload)
+                except Exception as exc:
+                    self._shown = ""
+                    self._note(f"Reader recovered from a frame error: {exc}")
+        finally:
+            if not self._stop.is_set():
+                self.root.after(8, self._drain)
 
     def _set_status(self, text: str) -> None:
         if self.face is not None:
@@ -626,6 +671,20 @@ class AutotypeApp:
                         self.face.send("NAME", speaker)
                     else:
                         self.name_var.set(speaker)
+        # Normalize a reversed prefix throughout typing AND deletion recovery.
+        # Preserve opponent readings as seen; our previous prefix is no longer
+        # authority to rewrite another player's answer.
+        active_prefix = self._typing_prompt
+        active_input = (self.typing or self._verify or self._typed_word or self._clear
+                        or self._needs_clear or self._resume_clear)
+        if whose != "theirs" and active_prefix and active_input:
+            if board.startswith(active_prefix[::-1]) and not board.startswith(active_prefix):
+                board = active_prefix + board[len(active_prefix):]
+                frame = dict(frame, prompt=board)
+        elif (self.ready and full and 1 <= len(board) <= 4 and not active_input
+              and whose != "theirs"):
+            board = self.session.resolve_prefix(board)
+            frame = dict(frame, prompt=board)
         if whose == "theirs":
             self._theirs_streak += 1
         elif whose == "ours":
@@ -673,6 +732,10 @@ class AutotypeApp:
         # Choices are useful even if the header is temporarily obscured. They
         # also make a failed turn read distinguishable from a missing dictionary.
         prefix = self.watch._prompt(board)
+        if (not prefix and self._shown and not self.typing and not self._verify
+                and not self._typed_word and not self._clear):
+            self._shown = ""
+            self._clear_choices()
         if (full and prefix and prefix != self._shown
                 and not self.typing and not self._verify and not self.watch.typed):
             self._shown = prefix
@@ -687,7 +750,8 @@ class AutotypeApp:
                 self._trial = None
                 signal.set()
             elif (whose == "ours" and full and board == trial_word
-                  and frame.get("captured_at", now) >= after and self._trial_count < 2
+                  and frame.get("captured_at", now) >= after and self._trial_count < 1
+                  and len(trial_word) >= max(5, len(self._typing_prompt + self._typed_suffix) - 2)
                   and not self.engine._is_known_word(trial_word) and roblox_focused()):
                 try:
                     press_enter()
@@ -792,21 +856,34 @@ class AutotypeApp:
         size = 15 if len(shown) > 10 else 28
         self.prompt_label.configure(font=("Helvetica", size, "bold"))
 
+    def _clear_choices(self) -> None:
+        if self.face is not None:
+            for index in range(1, 4):
+                self.face.send(f"C{index}", "—")
+            self.face.send("TYPE", "—")
+            self.face.send("TRAP", "—")
+        else:
+            for choice in self.choice_vars:
+                choice.set("—")
+            self.type_var.set("—")
+            self.trap_var.set("—")
+
     def _present(self, prompt: str) -> None:
         with self._lock:
             words = self.session.choices(prompt, 3)
             word, suffix, trap, _phase = self.session.choose(prompt)
         self._show_phase()
         labels = [f"{index + 1}  {words[index]}" if index < len(words) else "—" for index in range(3)]
+        type_label = suffix or ("ENTER" if word else "—")
         if self.face is not None:
             for index, label in enumerate(labels, 1):
                 self.face.send(f"C{index}", label)
-            self.face.send("TYPE", suffix or "—")
+            self.face.send("TYPE", type_label)
             self.face.send("TRAP", trap or "—")
         else:
             for index, label in enumerate(labels):
                 self.choice_vars[index].set(label)
-            self.type_var.set(suffix or "—")
+            self.type_var.set(type_label)
             self.trap_var.set(trap or "—")
         self._note(f"{prompt}  →  {word}" if word else f"No word for {prompt}")
 
@@ -826,13 +903,14 @@ class AutotypeApp:
         with self._lock:
             word, suffix, trap, _phase = self.session.choose(prompt)
         self._show_phase()
+        type_label = suffix or ("ENTER" if word else "—")
         if self.face is not None:
-            self.face.send("TYPE", suffix or "—")
+            self.face.send("TYPE", type_label)
             self.face.send("TRAP", trap or "—")
         else:
-            self.type_var.set(suffix or "—")
+            self.type_var.set(type_label)
             self.trap_var.set(trap or "—")
-        if not word or not suffix:
+        if not word:
             # An empty selection is not a completed attempt and must not latch
             # this prefix for the rest of the game.
             self.watch.played = ""
@@ -992,7 +1070,8 @@ class AutotypeApp:
             return
         state["read_at"] = captured
         board = frame.get("prompt", "")
-        full = bool(frame.get("full", True)) and "?" not in board
+        full = (bool(frame.get("full", True)) and frame.get("row_complete", True)
+                and "?" not in board)
         if not full or int(frame.get("tiles", len(board))) != len(board):
             state["hits"] = 0
             return
@@ -1110,7 +1189,8 @@ class AutotypeApp:
             return
         self._verify_read_at = captured
         board = frame.get("prompt", "")
-        full = bool(frame.get("full", True)) and "?" not in board
+        full = (bool(frame.get("full", True)) and frame.get("row_complete", True)
+                and "?" not in board)
         full = full and int(frame.get("tiles", len(board))) == len(board)
         # Small tiles may have different unread letters on successive frames.
         # Combine evidence by position, requiring two readings of EVERY letter
@@ -1122,14 +1202,37 @@ class AutotypeApp:
             for i, char in enumerate(board):
                 if char != "?":
                     self._verify_letters[i] = min(2, self._verify_letters[i] + 1)
-        else:
+        elif board and (len(board) == len(word) and any(
+                seen != "?" and seen != wanted for seen, wanted in zip(board, word))):
+            # Empty, clipped or animation frames add no evidence. They must
+            # not erase letters already confirmed in this submission attempt.
             self._verify_letters = [0] * len(word)
-        if full:
+        if full or frame.get("row_clipped", False):
             self._verify_hits = self._verify_hits + 1 if board == self._verify_board else 1
             self._verify_board = board
         else:
             self._verify_hits = 0
         verified = compatible and all(hits >= 2 for hits in self._verify_letters)
+        # A fixed obscured glyph need not discard an otherwise readable long
+        # answer. Require exact geometry, delivered length, two observations of
+        # most letters, and a unique dictionary completion.
+        if (not verified and compatible and now - after >= 1.2
+                and input_length == len(word) - len(self._typing_prompt)
+                and sum(h >= 2 for h in self._verify_letters) >= max(8, int(len(word) * 0.7))):
+            pattern = "".join(c if h >= 2 else "?" for c, h in zip(word, self._verify_letters))
+            candidates = self.engine.prefix_candidates(self._typing_prompt)
+            matches = [w for w in candidates if len(w) == len(word)
+                       and all(a == "?" or a == b for a, b in zip(pattern, w))]
+            verified = matches == [word]
+        # The game may drop tiles entirely when a long row exceeds its viewport.
+        # In that case the reader can see only a stable contiguous slice. Use
+        # the planned key count and two independent captures before Enter.
+        long_slice = (frame.get("row_clipped", False) or len(word) >= 20)
+        if (not verified and long_slice
+                and input_length == len(word) - len(self._typing_prompt)
+                and self._verify_hits >= 2 and now - after >= 0.35
+                and visible_word_slice(word, board)):
+            verified = True
         if verified:
             if (not self.armed or not self.engine._is_known_word(word)
                     or word in self.engine.used_words or word in self.engine.rejected_words):
@@ -1160,17 +1263,9 @@ class AutotypeApp:
         prefix = self._typing_prompt
         if not prefix:
             return
-        if now - after >= 1.2 and (not full or self._verify_repairs >= 2 or not board.startswith(prefix)):
-            # A permanently unreadable long word must not stall the match.
-            # Try a shorter dictionary answer after a verified clear.
-            with self._lock:
-                self.session.unreadable_words.add(word)
-                self.session.unreadable_prefixes.add(prefix)
-            self._note(f"Couldn't confirm {word}. Trying a shorter answer.")
-            self._clear_input(prefix)
-            return
-        if (not full or self._verify_hits < 2 or now - after < 0.25
-                or not board.startswith(prefix) or self._verify_repairs >= 2):
+        repair_wait = 0.25 if self._verify_repairs < 2 else 1.0
+        if (not full or self._verify_hits < 2 or now - after < repair_wait
+                or not board.startswith(prefix)):
             return
         self._verify_repairs += 1
         # Use the larger of delivered input and visible input: a clipped row
@@ -1182,18 +1277,24 @@ class AutotypeApp:
     def _check_enter_ack(self, frame: dict, whose: str, now: float) -> None:
         word = self._typed_word
         captured = frame.get("captured_at", now)
-        if (whose != "ours" or captured <= self._submit_read_at or not frame.get("full", True)
-                or not self.armed or "?" in frame.get("prompt", "")):
+        if (whose != "ours" or captured <= self._submit_read_at or not self.armed):
             return
         self._submit_read_at = captured
         board = frame.get("prompt", "")
+        clipped_word = ((frame.get("row_clipped", False)
+                         or (len(word) >= 20 and len(board) < len(word)))
+                        and visible_word_slice(word, board))
+        if not frame.get("full", True) and not clipped_word:
+            return
+        if "?" in board and not clipped_word:
+            return
         if int(frame.get("tiles", len(board))) != len(board):
             return
-        if board == word and not rejected_text(frame.get("error", "")):
+        if (board == word or clipped_word) and not rejected_text(frame.get("error", "")):
             self._submit_hits += 1
             self._new_prompt_hits = 0
-            if now - self._submitted_at >= 0.6 and self._submit_hits >= 2:
-                if self._submit_attempts >= 3:
+            if now - self._submitted_at >= 1.25 and self._submit_hits >= 2:
+                if self._submit_attempts >= 2:
                     # A response the reader cannot recognize must not leave the
                     # same answer stuck on screen for the rest of the match.
                     self._note(f"No acceptance for {word}. Trying another answer.")
@@ -1485,7 +1586,11 @@ def main() -> None:
                     kind, payload = app._queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                app._process_event(kind, payload)
+                try:
+                    app._process_event(kind, payload)
+                except Exception as exc:
+                    app._shown = ""
+                    app._note(f"Reader recovered from a frame error: {exc}")
         finally:
             app.close()
             if proc.poll() is None:

@@ -216,10 +216,16 @@ def templates() -> Templates:
 
 def read_tile(rgb: np.ndarray) -> str:
     """One lowercase letter, or "" when the glyph isn't clear enough to trust."""
-    letter, score, margin = templates().classify_tile(tile_feature(rgb))
-    if score < TILE_MIN_SCORE or margin < TILE_MIN_MARGIN:
+    feature = tile_feature(rgb)
+    if feature is None:
         return ""
-    return letter
+    t = templates()
+    letter, score, margin = t.classify_tile(feature)
+    alternatives = [(letter, score, margin)]
+    for transformed in (rgb[::-1, ::-1], rgb[:, ::-1], rgb[::-1]):
+        alternatives.append(t.classify_tile(tile_feature(transformed)))
+    letter, score, margin = max(alternatives, key=lambda item: item[1])
+    return letter if score >= TILE_MIN_SCORE and margin >= TILE_MIN_MARGIN else ""
 
 
 # --- template file -----------------------------------------------------------

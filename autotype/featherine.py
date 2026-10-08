@@ -295,6 +295,10 @@ def human_plan(word: str, name: str = "", rng: Optional[Callable[[], float]] = N
 
     random_fn = rng or random.random
     style = typing_style_for_name(name or "player")
+    style = dict(style)
+    rhythms = (style["rhythm"], "human", "staccato", "patient")
+    style["rhythm"] = rhythms[int(random_fn() * len(rhythms))]
+    style["tempo"] *= 0.8 + random_fn() * 0.4
     plan = build_plan(
         word,
         human=True,
@@ -306,6 +310,9 @@ def human_plan(word: str, name: str = "", rng: Optional[Callable[[], float]] = N
     # Short corrections add variation without a long pause at the end.
     for step in plan.steps[1:]:
         step.delay = max(0.035, step.delay * 0.84)
+    shape = _PACE_SHAPES[int(random_fn() * len(_PACE_SHAPES))][1]
+    for i, step in enumerate(plan.steps[1:], 1):
+        step.delay *= _pace_at(i, len(plan.steps), shape, random_fn) / 0.08
     plan.end_pause = 0.035 + random_fn() * 0.040
     if len(word) >= 5 and not any(s.kind == "back" for s in plan.steps) and random_fn() < 0.12:
         at = min(len(plan.steps) - 1, 1 + int(random_fn() * (len(plan.steps) - 1)))
@@ -314,17 +321,42 @@ def human_plan(word: str, name: str = "", rng: Optional[Callable[[], float]] = N
         if wrong != word[at]:
             plan.steps[at:at] = [AutotypeStep(before + wrong, 0.045, "type", wrong),
                                AutotypeStep(before, 0.12, "back", wrong)]
-    # An occasional early Enter is a request, not a raw key: the controller
-    # permits it only for a clearly read non-dictionary trial on our turn.
-    if random_fn() < 0.10:
-        trials = 0
-        for index in range(len(plan.steps) - 1, 0, -1):
-            if plan.steps[index].kind == "back" and plan.steps[index - 1].kind == "type":
-                previous = plan.steps[index - 1]
-                plan.steps.insert(index, AutotypeStep(previous.typed, 0.025, "enter", "\n"))
-                trials += 1
-                if trials == 2:
-                    break
+    # Occasionally reconsider a small stretch already typed. Each deletion
+    # and retyped character is explicit so the final displayed text is exact.
+    if len(word) >= 7 and random_fn() < 0.23:
+        stop = max(4, min(len(word), int(len(word) * (0.45 + random_fn() * 0.5))))
+        depth = min(stop, 2 + int(random_fn() * min(5, stop - 1)))
+        for index, step in enumerate(plan.steps):
+            if step.typed == word[:stop]:
+                back = [AutotypeStep(word[:n], 0.075 + random_fn() * 0.15, "back", "\b")
+                        for n in range(stop - 1, stop - depth - 1, -1)]
+                forward = [AutotypeStep(word[:n], 0.06 + random_fn() * 0.16, "type", word[n - 1])
+                           for n in range(stop - depth + 1, stop + 1)]
+                plan.steps[index + 1:index + 1] = back + forward
+                break
+    # Rarely finish with a nearby-key slip. An early Enter is only a trial of
+    # this nearly complete, visibly wrong input; final Enter still follows
+    # correction and screen verification in the controller.
+    if len(word) >= 6 and random_fn() < 0.08:
+        wrong = slip_key(word[-1], random_fn)
+        if wrong != word[-1]:
+            stem = word[:-1]
+            plan.steps.extend((AutotypeStep(stem, 0.09 + random_fn() * 0.15, "back", "\b"),
+                               AutotypeStep(stem + wrong, 0.06 + random_fn() * 0.12, "type", wrong),
+                               AutotypeStep(stem + wrong, 0.02, "enter", "\n"),
+                               AutotypeStep(stem, 0.11 + random_fn() * 0.2, "back", "\b"),
+                               AutotypeStep(word, 0.07 + random_fn() * 0.12, "type", word[-1])))
+    # Keep very long dictionary entries at a plausible pace. Scale intervals,
+    # preserving the chosen rhythm and a zero delay before the first key.
+    minimum = (max(9.0, len(word) * 0.12) if len(word) >= 70 else
+               len(word) * 0.16 if len(word) >= 25 else 0.0)
+    maximum = 12.0 if len(word) >= 70 else float("inf")
+    duration = sum(max(0.022, step.delay) for step in plan.steps[1:]) + plan.end_pause
+    if minimum and not minimum <= duration <= maximum:
+        target = max(minimum, min(duration, maximum))
+        scale = (target - plan.end_pause) / max(0.001, duration - plan.end_pause)
+        for step in plan.steps[1:]:
+            step.delay *= scale
     return plan
 
 def featherine_plan(word: str, rng: Optional[Callable[[], float]] = None) -> AutotypePlan:

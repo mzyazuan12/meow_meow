@@ -24,7 +24,7 @@ DEFAULT_CANCELLED_PROMPTS_PATH = (
 
 BLACKLISTED_TRAP_PREFIXES = frozenset({"bj"})
 
-_SPLIT_SUFFIXES = re.compile(r"[,;\s]+")
+_SPLIT_SUFFIXES = re.compile(r"[,;\s\[\](){}]+")
 
 def resource_path(*parts: str) -> Path:
     return REPO_ROOT.joinpath(*parts)
@@ -453,7 +453,7 @@ class Dyoe2Engine:
     def _is_allowed_word(self, word: str) -> bool:
         if word in self.used_words or word in self.rejected_words:
             return False
-        if self.casual_mode and word_has_punctuation(word):
+        if self.casual_mode and not getattr(self, "allow_punctuation", False) and word_has_punctuation(word):
             return False
         return True
 
