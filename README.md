@@ -1,4 +1,4 @@
-# Last Letter autotyper v4.5
+# eschaton v4.8
 
 Reads the Roblox Last Letter board, tracks accepted words for the current game, and types only the ending after the supplied prefix.
 

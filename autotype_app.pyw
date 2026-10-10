@@ -217,7 +217,7 @@ class AutotypeApp:
 
     def _build(self) -> None:
         win = self.root
-        win.title("Last Letter")
+        win.title("eschaton v4.8")
         win.geometry(self._place())
         try:
             win.attributes("-topmost", True)
@@ -231,7 +231,7 @@ class AutotypeApp:
 
         top = tk.Frame(root, bg=INK)
         top.pack(fill="x", padx=16, pady=(14, 0))
-        tk.Label(top, text="LAST LETTER", bg=INK, fg=BONE, font=("Helvetica", 20, "bold")).pack(side="left")
+        tk.Label(top, text="eschaton v4.8", bg=INK, fg=BONE, font=("Helvetica", 20, "bold")).pack(side="left")
         self.used_var = tk.StringVar(value="USED 0")
         tk.Label(top, textvariable=self.used_var, bg=INK, fg=MUTED, font=(mono, 11)).pack(side="right")
 

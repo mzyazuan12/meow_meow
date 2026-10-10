@@ -102,7 +102,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
                                                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskNonactivatingPanel
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
-    self.window.title = @"Last Letter";
+    self.window.title = @"eschaton v4.8";
     self.window.delegate = self;
     self.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     self.window.backgroundColor = inkColor();
@@ -118,8 +118,8 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     self.usedLabel.alignment = NSTextAlignmentRight;
     [root addSubview:self.usedLabel];
 
-    NSTextField *title = label(@"LAST LETTER", 22, boneColor(), NO);
-    title.frame = NSMakeRect(18, 730, 230, 30);
+    NSTextField *title = label(@"eschaton v4.8", 22, boneColor(), NO);
+    title.frame = NSMakeRect(18, 730, 280, 30);
     [root addSubview:title];
 
     NSTextField *kicker = label(@"DYOE   ·   FEATHERINE", 11, mutedColor(), YES);
