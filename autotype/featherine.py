@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
@@ -55,6 +56,9 @@ class AutotypePlan:
     tempo: float
     steps: List[AutotypeStep]
     end_pause: float
+    # Extras that actually made it into a live turn plan.
+    fidgets: int = 0
+    mistakes: int = 0
 
 def slip_key(ch: str, rng: Callable[[], float]) -> str:
     lower = ch.lower()
@@ -360,35 +364,391 @@ def human_plan(word: str, name: str = "", rng: Optional[Callable[[], float]] = N
     return plan
 
 KEY_HOLD = 0.022
-# Fastest interval between letters, about 13 keys a second including the hold.
-MIN_INTERVAL = 0.055
-FIDGET_CHANCE = 0.22
-TYPO_CHANCE = 0.25
-EARLY_ENTER_CHANCE = 0.08
-FIDGET_SLACK = 1.6
+# Fastest interval between letters when the clock is tight.
+MIN_INTERVAL = 0.052
+FIDGET_SLACK = 0.85
+
+_FAST_PAIRS = frozenset({
+    "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "ti", "es",
+    "or", "te", "of", "ed", "is", "it", "al", "ar", "st", "to", "nt", "ng",
+    "se", "ha", "as", "ou", "io", "le", "ve", "co", "me", "de", "la", "li",
+})
+
+# Non-linear envelopes so a word never sits on one interval.
+_TURN_SHAPES = (
+    ((0.0, 1.24), (0.30, 0.80), (1.0, 0.72)),
+    ((0.0, 0.76), (0.36, 0.68), (0.55, 1.40), (1.0, 0.86)),
+    ((0.0, 1.10), (0.20, 0.66), (0.48, 1.20), (0.72, 0.74), (1.0, 1.04)),
+    ((0.0, 0.70), (0.42, 0.94), (1.0, 1.30)),
+    ((0.0, 1.16), (0.14, 0.64), (0.50, 0.70), (0.58, 1.46), (1.0, 0.82)),
+    ((0.0, 0.86), (0.16, 1.28), (0.38, 0.68), (0.78, 0.76), (1.0, 1.18)),
+)
 
 
 def plan_duration(steps: Sequence[AutotypeStep]) -> float:
     return sum(step.delay for step in steps) + KEY_HOLD * sum(step.kind != "enter" for step in steps)
 
 
-def _fidget(prefix: str, suffix: str, rng: Callable[[], float]) -> List[List[str]]:
-    """Short bursts typed and erased before the answer, like "ism" -> "ismsm"."""
-    bursts = []
-    for _ in range(1 + int(rng() * 3)):
-        style = rng()
-        if style < 0.35 and prefix:
-            # Echo the end of the prompt, as if re-reading it.
-            tail = prefix[-2:] if len(prefix) >= 2 else prefix
-            burst = tail[1:] + tail if rng() < 0.5 else tail
-        elif style < 0.65 and suffix:
-            # A false start of the real answer.
-            burst = suffix[:1 + int(rng() * min(2, len(suffix)))]
+def _shape_at(index: int, length: int, points: tuple) -> float:
+    pos = index / max(1, length - 1)
+    delay = points[-1][1]
+    for left, right in zip(points, points[1:]):
+        if left[0] <= pos <= right[0]:
+            width = right[0] - left[0] or 1.0
+            mix = (pos - left[0]) / width
+            return left[1] + (right[1] - left[1]) * mix
+    return delay
+
+
+# --- live turn typing ------------------------------------------------------------
+#
+# Everything about a turn is drawn fresh: the pace, how the pace moves inside the
+# word, whether there are errors and which kind, and whether (and how) the turn
+# opens with fidgets. Nothing here is a fixed set of buckets.
+
+# One turn's pace in WPM: (low, high, weight). Slow turns do happen, and even
+# the quick band stays short of anything a person could not type.
+_PACE_BANDS = ((40.0, 62.0, 0.16), (62.0, 100.0, 0.49), (100.0, 128.0, 0.27), (128.0, 144.0, 0.08))
+_GAME_PACE = [1.0]
+
+
+def _game_drift(rng: Callable[[], float]) -> float:
+    """Slow drift in how fast this player is across a game (gap multiplier)."""
+    value = 1.0 + (_GAME_PACE[0] - 1.0) * 0.75 + (rng() - 0.5) * 0.24
+    _GAME_PACE[0] = min(1.24, max(0.80, value))
+    return _GAME_PACE[0]
+
+
+def _turn_mean(rng: Callable[[], float]) -> float:
+    """This turn's mean gap between letters, from a WPM drawn across the bands."""
+    roll = rng() * sum(weight for _lo, _hi, weight in _PACE_BANDS)
+    wpm = _PACE_BANDS[-1][1]
+    for low, high, weight in _PACE_BANDS:
+        if roll < weight:
+            wpm = low + rng() * (high - low)
+            break
+        roll -= weight
+    return 12.0 / wpm
+
+
+def _break_runs(body: List[float]) -> None:
+    """No four keys in a row may speed up or slow down steadily."""
+    for i in range(len(body) - 3):
+        a, b, c, d = body[i:i + 4]
+        if a < b < c < d or a > b > c > d:
+            body[i + 1], body[i + 2] = body[i + 2], body[i + 1]
+
+
+def _human_gaps(suffix: str, mean: float, rng: Callable[[], float]) -> List[float]:
+    n = len(suffix)
+    if not n:
+        return []
+    points = _TURN_SHAPES[int(rng() * len(_TURN_SHAPES))]
+    depth = 0.35 + rng() * 0.75
+    hesitate = 0.04 + rng() * 0.09
+    wander = 0.0
+    burst = 0
+    raw: List[float] = []
+    for i, ch in enumerate(suffix):
+        mult = 1.0 + (_shape_at(i, n, points) - 1.0) * depth
+        # A smooth drift on top of the envelope: speed leans one way for a
+        # few keys, then another, instead of hopping between fixed values.
+        wander = wander * 0.5 + (rng() - 0.5) * 0.6
+        mult *= math.exp(wander)
+        if i > 0 and burst <= 0 and rng() < 0.28:
+            burst = 2 + int(rng() * 3)
+        if burst > 0:
+            mult *= 0.62 + rng() * 0.20
+            burst -= 1
+            if burst == 0:
+                mult *= 1.25 + rng() * 0.45
+        if i and suffix[i - 1:i + 1].lower() in _FAST_PAIRS:
+            mult *= 0.74 + rng() * 0.14
+        if ch.lower() in AWKWARD_LETTERS:
+            mult *= 1.10 + rng() * 0.30
+        mult *= math.exp((rng() + rng() + rng() - 1.5) * 0.5)
+        roll = rng()
+        if roll < hesitate:
+            mult *= 1.8 + rng() * 1.5
+        elif roll < hesitate + 0.08:
+            mult *= 0.62 + rng() * 0.16
+        raw.append(mult)
+    body = raw[1:] if n > 1 else raw[:]
+    if len(body) >= 3:
+        for _ in range(3):
+            if max(body) > min(body) * 1.7:
+                break
+            slow, fast = int(rng() * len(body)), int(rng() * len(body))
+            body[slow] *= 1.5 + rng() * 0.6
+            body[fast] *= 0.55 + rng() * 0.15
+        _break_runs(body)
+    raw = ([raw[0]] + body) if n > 1 else body
+    average = sum(body) / len(body) if body else 1.0
+    # The turn keeps the pace it was dealt; only the shape inside it varies.
+    return [min(0.62, max(0.048, mean * m / average)) for m in raw]
+
+
+def _reaction(budget: float, fidget: Sequence, rng: Callable[[], float]) -> float:
+    # Board reading already took a frame or two; the first key goes out at once.
+    if fidget or budget <= 2.5:
+        return rng() * 0.006
+    return rng() * 0.012
+
+
+def _fidget_text(prefix: str, suffix: str, rng: Callable[[], float]) -> str:
+    roll = rng()
+    first = (suffix or prefix or "e")[0]
+    if roll < 0.20 and prefix:
+        tail = prefix[-2:] if len(prefix) >= 2 else prefix
+        if rng() < 0.4 and len(tail) == 2:
+            return tail[1] + tail
+        return tail
+    if roll < 0.46 and suffix:
+        return suffix[:1 + int(rng() * min(2, len(suffix)))]
+    if roll < 0.64:
+        return first + slip_key(first, rng)
+    if roll < 0.80:
+        wrong = slip_key(first, rng)
+        return wrong if wrong != first else first
+    if roll < 0.92:
+        ch = suffix[int(rng() * min(2, len(suffix)))] if suffix else first
+        return ch + ch
+    wander = slip_key(first, rng)
+    return (wander + slip_key(wander, rng))[:2] or first
+
+
+_FIDGET_STYLES = ("tap", "stutter", "wander", "head", "messy", "mash", "echo")
+
+
+def _fidget_act(style: str, prefix: str, suffix: str, rng: Callable[[], float]) -> list:
+    """One fidget as (op, key, delay) with its own speed. It always ends empty.
+
+    The first op's delay is 0; the caller supplies the lead-in pause.
+    """
+    speed = 0.55 + rng() * 1.45
+    if style in ("mash", "stutter"):
+        speed *= 0.65
+    first = (suffix or prefix or "e")[0]
+    ops: list = []
+
+    def type_text(text: str) -> None:
+        for ch in text:
+            gap = 0.0 if not ops else max(0.04, (0.045 + rng() * 0.10) * speed)
+            ops.append(("type", ch, gap))
+
+    def erase(count: int, hold: float = 0.0) -> None:
+        for k in range(count):
+            gap = (0.07 + rng() * 0.17) if k == 0 else (0.028 + rng() * 0.075)
+            ops.append(("back", "\b", max(0.03, gap * speed + (hold if k == 0 else 0.0))))
+
+    def neighbours(count: int) -> str:
+        out, ch = "", first
+        for _ in range(count):
+            ch = slip_key(ch, rng)
+            out += ch
+        return out
+
+    if style == "stutter":
+        type_text(first)
+        erase(1)
+        ops.append(("type", first if rng() < 0.5 else slip_key(first, rng), 0.03 + rng() * 0.08))
+        erase(1)
+    elif style == "wander":
+        text = neighbours(1 + int(rng() * 3))
+        type_text(text)
+        erase(len(text), 0.10 + rng() * 0.28)
+    elif style == "head" and suffix:
+        text = suffix[:1 + int(rng() * min(2, len(suffix)))]
+        type_text(text)
+        erase(len(text), rng() * 0.16)
+    elif style == "messy":
+        type_text(first + neighbours(2))
+        erase(1)
+        type_text(slip_key(first, rng))
+        erase(3)
+    elif style == "mash":
+        text = neighbours(3 + int(rng() * 2))
+        type_text(text)
+        erase(len(text))
+    elif style == "echo" and prefix:
+        text = prefix[-2:]
+        type_text(text)
+        erase(len(text))
+    else:
+        text = _fidget_text(prefix, suffix, rng)[:3] or "e"
+        type_text(text)
+        erase(len(text))
+    return ops
+
+
+def _fidget_acts(prefix: str, suffix: str, budget: float,
+                 rng: Callable[[], float]) -> tuple:
+    """Zero to three fidgets before the word, and the pause after each.
+
+    Only a 1-2 letter prefix with time to spare fidgets repeatedly. The pauses
+    between them range from almost none to a real beat.
+    """
+    if not suffix:
+        return [], []
+    tiny, short = len(prefix) <= 1, len(prefix) <= 2
+    if tiny:
+        chance = 0.36 if budget > 4 else 0.12
+    elif short:
+        chance = 0.26 if budget > 4 else 0.09
+    else:
+        chance = 0.09 if budget > 5 else 0.03
+    if rng() >= chance:
+        return [], []
+    count = 1
+    if short and budget > 5:
+        if rng() < (0.42 if tiny else 0.30):
+            count = 2
+            if budget > 7 and rng() < (0.34 if tiny else 0.20):
+                count = 3
+    elif not short and budget > 6 and rng() < 0.10:
+        count = 2
+    pool = list(_FIDGET_STYLES)
+    acts, pauses = [], []
+    for index in range(count):
+        style = pool.pop(int(rng() * len(pool)))
+        acts.append(_fidget_act(style, prefix, suffix, rng))
+        roll = rng()
+        if index + 1 < count:
+            if roll < 0.22:
+                pauses.append(0.015 + rng() * 0.05)
+            elif roll < 0.72:
+                pauses.append(0.08 + rng() * 0.20)
+            else:
+                pauses.append(0.22 + rng() * 0.36)
+        elif roll < 0.30:
+            pauses.append(0.02 + rng() * 0.06)
+        elif roll < 0.80:
+            pauses.append(0.07 + rng() * 0.18)
         else:
-            first = (suffix or prefix or "e")[0]
-            burst = first + slip_key(first, rng)
-        bursts.append(burst[:3] or "e")
-    return bursts
+            pauses.append(0.24 + rng() * 0.30)
+    return acts, pauses
+
+
+def _fix_speed(rng: Callable[[], float]) -> float:
+    """How fast this slip gets corrected: mostly medium to fast, rarely slow."""
+    roll = rng()
+    if roll < 0.30:
+        return 0.55 + rng() * 0.15
+    if roll < 0.88:
+        return 0.75 + rng() * 0.40
+    return 1.2 + rng() * 0.5
+
+
+def _one_error(prefix: str, suffix: str, low: int, rng: Callable[[], float],
+               is_word: Optional[Callable[[str], bool]]) -> Optional[dict]:
+    n = len(suffix)
+    weights = (("sub", 0.34), ("dup", 0.12), ("swap", 0.14), ("skip", 0.12), ("end", 0.20))
+    for _attempt in range(6):
+        roll = rng() * sum(w for _s, w in weights)
+        style = weights[-1][0]
+        for name, weight in weights:
+            if roll < weight:
+                style = name
+                break
+            roll -= weight
+        ev: Optional[dict] = None
+        if style == "end":
+            if n < 3 or low > n - 2:
+                continue
+            at = n - 1 if rng() < 0.65 or low > n - 2 else n - 2
+            at = max(at, low)
+            wrong = slip_key(suffix[at], rng)
+            if wrong == suffix[at]:
+                wrong = "e" if suffix[at] != "e" else "a"
+            text = wrong + suffix[at + 1:]
+            if is_word is not None and is_word(prefix + suffix[:at] + text):
+                continue
+            ev = dict(style=style, at=at, wrong=text, retype=suffix[at:], consumed=n - at,
+                      enter_try=True)
+        elif style in ("sub", "dup"):
+            if low >= n:
+                continue
+            at = int(low + rng() * (n - low))
+            if at == 0 and n > 2 and rng() < 0.6:
+                at = 1 + int(rng() * (n - 1))
+            ch = suffix[at]
+            if style == "dup":
+                if at + 1 < n and suffix[at + 1] == ch:
+                    continue  # the word really doubles it; nothing is wrong
+                ev = dict(style=style, at=at, wrong=ch + ch, back=1, retype="", consumed=1)
+            else:
+                wrong = slip_key(ch, rng)
+                if wrong == ch:
+                    wrong = "e" if ch != "e" else "a"
+                pick = rng()
+                run = 0 if pick < 0.50 else 1 if pick < 0.75 else 2 if pick < 0.92 else 3
+                run = min(run, n - 1 - at)
+                ev = dict(style=style, at=at, wrong=wrong + suffix[at + 1:at + 1 + run],
+                          retype=suffix[at:at + 1 + run], consumed=1 + run)
+        elif style == "swap":
+            if low > n - 2:
+                continue
+            at = int(low + rng() * (n - 1 - low))
+            if suffix[at] == suffix[at + 1]:
+                continue
+            run = min(1 if rng() < 0.30 else 0, n - 2 - at)
+            ev = dict(style=style, at=at, wrong=suffix[at + 1] + suffix[at] + suffix[at + 2:at + 2 + run],
+                      retype=suffix[at:at + 2 + run], consumed=2 + run)
+        else:  # skip a letter, notice a key or two later
+            if low > n - 2:
+                continue
+            at = int(low + rng() * (n - 1 - low))
+            if suffix[at] == suffix[at + 1]:
+                continue
+            run = min(0 if rng() < 0.5 else 1 if rng() < 0.7 else 2, n - 2 - at)
+            ev = dict(style=style, at=at, wrong=suffix[at + 1:at + 2 + run],
+                      retype=suffix[at:at + 2 + run], consumed=2 + run)
+        if ev is None:
+            continue
+        ev.setdefault("back", len(ev["wrong"]))
+        fix = _fix_speed(rng)
+        late = 1.0 + 0.2 * (len(ev["wrong"]) - 1)
+        ev["notice"] = (0.06 + rng() * 0.24) * fix * min(1.6, late)
+        ev["back_gaps"] = [max(0.03, (0.028 + rng() * 0.075) * fix) for _ in range(max(0, ev["back"] - 1))]
+        ev["retype_gaps"] = [max(0.04, (0.05 + rng() * 0.11) * fix) for _ in ev["retype"]]
+        ev["run_speed"] = 0.62 + rng() * 0.32
+        ev["try_wait"] = 0.035 + rng() * 0.07
+        if ev.get("enter_try"):
+            # Enter was hit on the misspelling: the pause to read it is longer.
+            ev["notice"] = max(ev["notice"], 0.09 + rng() * 0.22)
+        return ev
+    return None
+
+
+def _error_events(prefix: str, suffix: str, rng: Callable[[], float],
+                  is_word: Optional[Callable[[str], bool]]) -> dict:
+    """Mistakes for this turn, keyed by the letter they start at.
+
+    Some turns are clean, some sloppy. A slip can be caught at once or a few
+    keys later, and what it looks like changes each time.
+    """
+    n = len(suffix)
+    if n < 2:
+        return {}
+    mood = rng()
+    chance = 0.0 if mood < 0.30 else 0.36 if mood < 0.80 else 0.66
+    events: dict = {}
+    covered = -1
+    if rng() < chance:
+        count = 1 + (n >= 6 and rng() < 0.22) + (n >= 9 and rng() < 0.10)
+        for _ in range(count):
+            ev = _one_error(prefix, suffix, covered + 1, rng, is_word)
+            if ev is None:
+                break
+            events[ev["at"]] = ev
+            covered = ev["at"] + ev["consumed"]
+    # Now and then Enter is hit on a correct but unfinished word, then typing goes on.
+    if n >= 4 and is_word is not None and rng() < 0.05:
+        at = 2 + int(rng() * (n - 2))
+        if at > covered and at not in events and not is_word(prefix + suffix[:at]):
+            events[at] = dict(style="early", at=at, wait=0.035 + rng() * 0.07,
+                              resume=0.16 + rng() * 0.18)
+    return events
 
 
 def turn_plan(suffix: str, prefix: str = "", budget: Optional[float] = None,
@@ -396,92 +756,95 @@ def turn_plan(suffix: str, prefix: str = "", budget: Optional[float] = None,
               is_word: Optional[Callable[[str], bool]] = None) -> AutotypePlan:
     """Keys for one turn, ending with Enter straight after the last letter.
 
-    The pace stays within human limits. With spare time there is sometimes a
-    fidget before the answer, a corrected typo, or an Enter pressed one to
-    three letters early on a non-word. Extras are dropped, then the pace is
-    raised to its floor, to finish inside ``budget`` seconds.
+    Pace, fidgets and mistakes are all drawn per turn, and pace also drifts
+    across a game. Spare time can add fidgets, then mistakes; they are dropped
+    in that order, then the pace is raised to its floor, to finish inside
+    ``budget`` seconds. The finished word is always what Enter submits.
     """
     random_fn = rng or random.random
     budget = float("inf") if budget is None else max(0.0, budget)
-    base = 0.09 + random_fn() * 0.06
-    # Reading the board already took two captures; this is the rest of a reaction.
-    reaction = 0.03 + random_fn() * 0.12 if budget > 2.5 else random_fn() * 0.04
+    drift = _game_drift(random_fn) if rng is None else 1.0
+    mean = _turn_mean(random_fn) * drift
+    letters = _human_gaps(suffix, mean, random_fn)
+    acts, pauses = _fidget_acts(prefix, suffix, budget, random_fn)
+    reaction = _reaction(budget, acts, random_fn)
+    errors = _error_events(prefix, suffix, random_fn, is_word)
+    n = len(suffix)
 
-    def key_gap(ch: str) -> float:
-        delay = base * (0.75 + random_fn() * 0.5)
-        if ch in AWKWARD_LETTERS and random_fn() < 0.4:
-            delay += 0.03 + random_fn() * 0.05
-        return delay
+    def gap_at(index: int, scale: float) -> float:
+        if 0 <= index < len(letters):
+            return letters[index] * scale
+        return mean * (0.7 + random_fn() * 0.5) * scale
 
-    letters = [key_gap(ch) for ch in suffix]
-    hesitations = {i: 0.15 + random_fn() * 0.25 for i in range(2, len(suffix))
-                   if len(suffix) >= 8 and random_fn() < 0.05}
-    fidget = _fidget(prefix, suffix, random_fn) if suffix and random_fn() < FIDGET_CHANCE else []
-    typo_at = (1 + int(random_fn() * (len(suffix) - 2))
-               if len(suffix) >= 3 and random_fn() < TYPO_CHANCE else -1)
-    typo_style = random_fn()
-    early_at = -1
-    if len(suffix) >= 4 and random_fn() < EARLY_ENTER_CHANCE:
-        at = len(suffix) - 1 - int(random_fn() * 3)
-        if at >= 2 and is_word is not None and not is_word(prefix + suffix[:at]):
-            early_at = at
-
-    def build(scale: float, extras: bool) -> List[AutotypeStep]:
+    def build(scale: float, with_fidgets: bool, with_errors: bool) -> List[AutotypeStep]:
         steps: List[AutotypeStep] = []
         pause = reaction
 
         def push(typed: str, delay: float, kind: str, key: str) -> None:
             steps.append(AutotypeStep(typed, delay, kind, key))
 
-        if extras:
-            for burst in fidget:
-                for n in range(1, len(burst) + 1):
-                    push(burst[:n], pause if n == 1 else key_gap(burst[n - 1]) * scale, "type", burst[n - 1])
-                    pause = 0.0
-                for n in range(len(burst) - 1, -1, -1):
-                    push(burst[:n], (0.18 + random_fn() * 0.3 if n == len(burst) - 1 else
-                                     0.05 + random_fn() * 0.05), "back", "\b")
-                pause = 0.12 + random_fn() * 0.3
+        if with_fidgets:
+            for act, after in zip(acts, pauses):
+                shown = ""
+                for position, (op, key, gap) in enumerate(act):
+                    delay = pause if position == 0 else gap
+                    if op == "type":
+                        shown += key
+                        push(shown, delay, "type", key)
+                    else:
+                        shown = shown[:-1]
+                        push(shown, delay, "back", "\b")
+                pause = after
         shown = ""
-        for i, ch in enumerate(suffix):
-            delay = (pause if i == 0 else letters[i] * scale) + (hesitations.get(i, 0.0) if extras else 0.0)
+        i = 0
+        while i < n:
+            delay = pause if i == 0 else gap_at(i, scale)
             pause = 0.0
-            if extras and i == early_at:
-                push(shown, 0.04 + random_fn() * 0.08, "early", "\n")
-                delay = 0.25 + random_fn() * 0.3
-            if extras and i == typo_at:
-                wrong = slip_key(ch, random_fn)
-                if wrong == ch:
-                    wrong = "e" if ch != "e" else "a"
-                push(shown + wrong, delay, "type", wrong)
-                if typo_style < 0.45 and i + 1 < len(suffix):
-                    # Noticed one letter late.
-                    nxt = suffix[i + 1]
-                    push(shown + wrong + nxt, key_gap(nxt) * scale, "type", nxt)
-                    push(shown + wrong, 0.14 + random_fn() * 0.2, "back", "\b")
-                    push(shown, 0.05 + random_fn() * 0.05, "back", "\b")
-                else:
-                    push(shown, 0.12 + random_fn() * 0.2, "back", "\b")
-                delay = 0.07 + random_fn() * 0.08
-            shown += ch
-            push(shown, delay, "type", ch)
+            ev = errors.get(i) if with_errors else None
+            if ev is not None and ev["style"] == "early":
+                push(shown, ev["wait"], "early", "\n")
+                delay = ev["resume"]
+                ev = None
+            if ev is None:
+                shown += suffix[i]
+                push(shown, delay, "type", suffix[i])
+                i += 1
+                continue
+            for k, ch in enumerate(ev["wrong"]):
+                shown += ch
+                push(shown, delay if k == 0 else gap_at(i + k, scale) * ev["run_speed"], "type", ch)
+            if ev.get("enter_try"):
+                push(shown, ev["try_wait"], "early", "\n")
+            for k in range(ev["back"]):
+                shown = shown[:-1]
+                push(shown, ev["notice"] if k == 0 else ev["back_gaps"][k - 1], "back", "\b")
+            for k, ch in enumerate(ev["retype"]):
+                shown += ch
+                push(shown, ev["retype_gaps"][k], "type", ch)
+            i += ev["consumed"]
         push(shown, 0.0 if not steps else 0.01 + random_fn() * 0.03, "enter", "\n")
         return steps
 
-    steps = build(1.0, True)
-    # Fidgets need real spare time; a typo or early Enter needs a little.
-    slack = FIDGET_SLACK if fidget else 0.6
+    use_fidgets, use_errors = True, True
+    steps = build(1.0, True, True)
+    slack = FIDGET_SLACK if acts else 0.55
     if plan_duration(steps) + slack > budget:
-        steps = build(1.0, False)
-    if plan_duration(steps) > budget and len(suffix) > 1:
-        # Faster, but never beyond the human floor; the word was chosen to fit.
-        fixed = plan_duration(build(0.0, False))
+        use_fidgets = False
+        steps = build(1.0, False, True)
+        if plan_duration(steps) + 0.55 > budget:
+            use_errors = False
+            steps = build(1.0, False, False)
+    if plan_duration(steps) > budget and n > 1:
+        use_fidgets = use_errors = False
+        fixed = plan_duration(build(0.0, False, False))
         natural = max(1e-6, plan_duration(steps) - fixed)
-        steps = build(min(1.0, max(0.0, (budget - fixed) / natural)), False)
+        steps = build(min(1.0, max(0.0, (budget - fixed) / natural)), False, False)
         for step in steps[1:]:
             if step.kind == "type":
                 step.delay = max(MIN_INTERVAL, step.delay)
-    return AutotypePlan(suffix, True, "turn", base, steps, 0.0)
+    mistakes = sum(1 for ev in errors.values() if ev["style"] != "early") if use_errors else 0
+    return AutotypePlan(suffix, True, "turn", mean, steps, 0.0,
+                        fidgets=len(acts) if use_fidgets else 0, mistakes=mistakes)
 
 
 def edit_plan(current: str, target: str, budget: Optional[float] = None,
@@ -502,7 +865,9 @@ def edit_plan(current: str, target: str, budget: Optional[float] = None,
     base = 0.08 + random_fn() * 0.05
     for n in range(common + 1, len(target) + 1):
         steps.append(AutotypeStep(target[:n], pause, "type", target[n - 1]))
-        pause = base * (0.75 + random_fn() * 0.5)
+        pause = base * (0.58 + random_fn() * 0.84)
+        if random_fn() < 0.12:
+            pause += 0.04 + random_fn() * 0.08
     steps.append(AutotypeStep(target, 0.0 if not steps else 0.01 + random_fn() * 0.03, "enter", "\n"))
     total = plan_duration(steps)
     if total > budget and len(steps) > 2:

@@ -264,14 +264,12 @@ class WordRegressionTests(unittest.TestCase):
         watch = BoardWatch()
         watch.observe('a', 'theirs')
         watch.observe('at', 'theirs')
-        watch.observe('t', 'ours')
         event = watch.observe('t', 'ours')
         self.assertEqual(self.session.recover_partial(event['partials'], event['ending'], event['given']), 'at')
 
     def test_attach_mid_turn_keeps_a_short_complete_word(self):
         watch = BoardWatch()
         watch.observe('cat', 'theirs')
-        watch.observe('t', 'ours')
         event = watch.observe('t', 'ours')
         self.assertEqual(self.session.recover_partial(event['partials'], event['ending'], event['given']), 'cat')
 
@@ -375,7 +373,7 @@ class TypingRegressionTests(unittest.TestCase):
         # Enter comes straight after the last letter.
         self.assertEqual(events[-3], ('key', 'e'))
         self.assertEqual(events[-2][0], 'wait')
-        self.assertLessEqual(events[-2][1], 0.05)
+        self.assertLessEqual(events[-2][1], 0.12)
         self.assertEqual(app._typed_word, 'stone')
 
     def test_focus_loss_prevents_the_next_key_and_enter(self):

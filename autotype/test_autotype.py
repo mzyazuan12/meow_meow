@@ -99,8 +99,8 @@ class BoardWatchTests(unittest.TestCase):
         watch.observe("nectar", "theirs", now=0)
         stored = watch.observe("r", "ours", now=0.1)
         self.assertIn("nectar", stored["candidates"])
-        self.assertEqual(stored["play"], "")
-        self.assertEqual(watch.observe("r", "ours", now=0.9)["play"], "r")
+        # Their word ends in the prompt, so one read is enough to start.
+        self.assertEqual(stored["play"], "r")
 
     def test_a_growing_word_is_kept_in_full(self) -> None:
         watch = BoardWatch()
@@ -110,7 +110,7 @@ class BoardWatchTests(unittest.TestCase):
         stored = watch.observe("r", "ours", now=0.5)
         self.assertIn("nectar", stored["candidates"])
         self.assertEqual(stored["stored"], "nectar")
-        self.assertEqual(stored["play"], "")
+        self.assertEqual(stored["play"], "r")
 
     def test_a_blank_frame_does_not_erase_the_word(self) -> None:
         watch = BoardWatch()
@@ -212,7 +212,7 @@ class FeatherineTests(unittest.TestCase):
         session.set_mode("spam")
         session.set_spam_suffixes("ne")
         word, suffix, _trap, phase = session.choose("st")
-        self.assertEqual(phase, 5)
+        self.assertEqual(phase, 2)
         self.assertEqual(word, "stone")
         self.assertTrue(word.endswith("ne"))
         self.assertEqual(suffix, word[2:])

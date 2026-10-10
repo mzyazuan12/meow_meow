@@ -36,6 +36,69 @@ class RequestedFixTests(unittest.TestCase):
         s.engine.set_words(['kingdom'], validate_giveable=False)
         self.assertEqual(s.choose('gnik')[:2], ('kingdom', 'dom'))
 
+    def test_opponent_ending_decides_a_mirrored_prompt(self):
+        s = MatchSession(Dyoe2Engine(['telephone', 'telex', 'eletfoo'], validate_giveable=False))
+        s.opponent_word = 'prevelet'
+        self.assertEqual(s.resolve_prefix('tele'), 'elet')
+        self.assertEqual(s.resolve_prefix('elet'), 'elet')
+        self.assertEqual(s.choose('tele')[0], 'eletfoo')
+        # Their word ended in tele, so a readable tele is not flipped. Their
+        # word itself is used, so the other tele word answers it.
+        s.opponent_word = 'telephone'
+        self.assertEqual(s.resolve_prefix('tele'), 'tele')
+        self.assertEqual(s.choose('tele')[0], 'telex')
+        # No dictionary hit for elet must not undo an ending of elet.
+        s.engine.set_words(['telephone', 'telex'], validate_giveable=False)
+        s.opponent_word = 'prevelet'
+        self.assertEqual(s.resolve_prefix('tele'), 'elet')
+        s.opponent_word = ''
+        self.assertEqual(s.resolve_prefix('tele'), 'tele')
+
+    def test_garbled_tail_still_decides_direction_from_its_first_letters(self):
+        s = MatchSession(Dyoe2Engine(['kickoffs', 'kicking', 'sfumato', 'fsfoo'], validate_giveable=False))
+        # They typed kickoffs; the capture only saw kickkf. kick... can end in
+        # fs but never in sf, so the sf on the board is the mirrored fs.
+        s.opponent_word = 'kickkf'
+        self.assertEqual(s.resolve_prefix('sf'), 'fs')
+        # When the head can end in sf, the reading stays as it is.
+        s.engine.set_words(['kicksf', 'sfumato', 'fsfoo'], validate_giveable=False)
+        self.assertEqual(s.resolve_prefix('sf'), 'sf')
+        # Both directions possible: nothing is decided from the head alone.
+        s.engine.set_words(['kickoffs', 'kicksf', 'sfumato'], validate_giveable=False)
+        self.assertEqual(s.resolve_prefix('sf'), 'sf')
+        s.opponent_word = ''
+        self.assertEqual(s.resolve_prefix('sf'), 'sf')
+
+    def test_garbled_word_is_still_recovered_from_head_and_ending(self):
+        s = MatchSession(Dyoe2Engine(['kickoffs', 'kicking'], validate_giveable=False))
+        self.assertEqual(s.recover_partial(['kickkf'], 'fs', 'ki'), 'kickoffs')
+
+    def test_mirrored_prompt_is_played_from_the_opponents_ending(self):
+        app, _ = make_app(('eletfoo', 'telephone'))
+        app._name = 'player'
+        app._handle_frame(frame('prevelet', 'opponent'))
+        app._handle_frame(frame('tele'))
+        app._handle_frame(frame('tele'))
+        app._start_typing.assert_called_with('elet')
+
+    def test_only_their_words_ending_skips_the_second_read(self):
+        w = BoardWatch()
+        w.observe('prevelet', 'theirs', now=0)
+        self.assertEqual(w.observe('elet', 'ours', now=0.1)['play'], 'elet')
+        w = BoardWatch()
+        w.observe('prevelet', 'theirs', now=0)
+        self.assertEqual(w.observe('tele', 'ours', now=0.1)['play'], '')
+        self.assertEqual(w.observe('tele', 'ours', now=0.2)['play'], 'tele')
+
+    def test_opponent_word_follows_a_backspaced_correction(self):
+        w = BoardWatch()
+        for board in ('pre', 'prevelets', 'prevelet'):
+            w.observe(board, 'theirs')
+        self.assertEqual(w.opponent_word, 'prevelet')
+        # The collapsed prompt while the header lags is not their word.
+        w.observe('tele', 'theirs')
+        self.assertEqual(w.opponent_word, 'prevelet')
+
     def test_self_solve_sometimes_and_enter_without_keys(self):
         s = MatchSession(Dyoe2Engine(['king', 'kingdom'], validate_giveable=False))
         with patch('autotype.session.random.random', return_value=0):
@@ -83,6 +146,8 @@ class RequestedFixTests(unittest.TestCase):
     def test_brackets_punctuation_and_rhythm(self):
         self.assertEqual(normalize_hybrid_suffixes('[ing][ary] (ness), ous'), ('ing','ary','ness','ous'))
         s = MatchSession(Dyoe2Engine(["a-b'c"], validate_giveable=False))
+        self.assertEqual(s.choose('a'), ('', '', None, 1))
+        s.set_mode('pro')
         self.assertEqual(s.choose('a')[1], "-b'c")
         profiles = set()
         for seed in range(20):

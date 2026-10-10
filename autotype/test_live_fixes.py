@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import queue
 import random
+import tempfile
 import threading
 import time
 import unittest
@@ -177,8 +178,11 @@ class SubmissionTests(unittest.TestCase):
         with patch.object(app, "_launch_typing") as launch:
             app._schedule_retry("stone", used=False)
         _prompt, word, plan = launch.call_args[0]
-        self.assertEqual(word, "stones")
-        self.assertEqual(plan.steps[-1].typed, "tones")
+        # Only "sttone" was refused. "stone" was never submitted, so it is
+        # still a fair answer and one Backspace away.
+        self.assertIn(word, ("stone", "stones"))
+        self.assertNotIn("stone", app.engine.rejected_words)
+        self.assertEqual(plan.steps[-1].typed, word[1:])
         self.assertEqual(sum(s.kind == "back" for s in plan.steps), 4)
 
     def test_own_growing_input_never_restarts_as_a_longer_prefix(self):
@@ -208,19 +212,206 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(keys, list("caboron") + ["ENTER"])
         self.assertEqual(app.watch.typed, "ecaboron")
 
-    def test_early_enter_is_occasional_and_never_on_a_word(self):
-        counts = []
+    def test_a_full_action_queue_does_not_stall_the_next_frame(self):
+        app, _ = make_app()
+        app._queue = queue.Queue(maxsize=1)
+        app._put_event("ACTION", ("NO", ""))
+        started = time.monotonic()
+        app._put_event("FRAME", {"prompt": "tele"})
+        self.assertLess(time.monotonic() - started, 0.3)
+
+    def test_capture_restarts_after_the_reader_returns(self):
+        app, _ = make_app()
+        calls = []
+
+        def reader(*_args, **_kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("grab failed")
+            if len(calls) == 3:
+                app._stop.set()
+
+        with patch.object(app_module, "run_capture", side_effect=reader):
+            app._capture_forever()
+        self.assertEqual(len(calls), 3)
+
+    def test_dictionary_file_is_dict_7(self):
+        self.assertEqual(app_module.DICT_PATH.name, "dict (7).txt")
+
+    def test_missing_words_are_added_only_when_typed_in(self):
+        app, face = make_app(("stone", "star"))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "dict.txt"
+            path.write_text("star\nstone", encoding="utf-8")
+            with patch.object(app_module, "DICT_PATH", path):
+                app.handle("ADDWORDS", "Stone, quokka  zorp")
+                self.assertEqual(path.read_text(encoding="utf-8"), "star\nstone\nquokka\nzorp\n")
+                app.handle("ADDWORDS", "quokka nope!")
+                self.assertEqual(path.read_text(encoding="utf-8"), "star\nstone\nquokka\nzorp\n")
+        self.assertTrue(app.engine._is_known_word("quokka"))
+        self.assertTrue(app.engine._is_known_word("zorp"))
+        self.assertFalse(app.engine._is_known_word("nope!"))
+        self.assertIn("quokka", app.engine.prefix_candidates("quo"))
+        self.assertIn("quokka", app.engine._words_ending_with("ka"))
+        self.assertEqual(face.values["LOG"], "Left out: nope!.")
+        self.assertEqual(face.values["ADDTEXT"], "")
+        from dyoe2_engine import DEFAULT_LAST_TXT
+        self.assertEqual(DEFAULT_LAST_TXT.name, "dict (7).txt")
+
+    def _type_word(self, app, word, prompt, board_after_last=None, on_confirm=None):
+        keys = []
+        planted = []
+
+        def tap(kind, key, hold):
+            keys.append(key)
+            if board_after_last and key == word[-1] and not planted:
+                planted.append(True)
+                app._last_frame = {
+                    "prompt": board_after_last,
+                    "full": True,
+                    "row_complete": True,
+                    "tiles": len(board_after_last),
+                    "captured_at": time.monotonic() + 10,
+                }
+
+        class Clock:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                if on_confirm and abs(seconds - 0.07) < 0.001:
+                    on_confirm()
+                return False
+
+        with patch.object(app_module, "focus_roblox", return_value=True), \
+             patch.object(app_module, "roblox_focused", return_value=True), \
+             patch.object(app_module, "tap_key", side_effect=tap), \
+             patch.object(app_module, "press_enter", side_effect=lambda: keys.append("ENTER")):
+            app._typing_prompt = prompt
+            app._type_suffix(app._gen, word, app_module.edit_plan("", word[len(prompt):]), Clock())
+            while not app._queue.empty():
+                app._process_event(*app._queue.get_nowait())
+        return keys
+
+    def test_a_missing_last_letter_is_typed_again_before_enter(self):
+        app, _ = make_app(("sessionary",))
+        keys = self._type_word(app, "sessionary", "ses", "sessionar")
+        self.assertEqual(keys, list("sionary") + ["y", "ENTER"])
+        self.assertEqual(app.watch.typed, "sessionary")
+
+    def test_a_leftover_typo_is_corrected_before_enter(self):
+        app, _ = make_app(("sessionary",))
+        keys = self._type_word(app, "sessionary", "ses", "sessioniry")
+        self.assertEqual(keys, list("sionary") + ["\b", "\b", "\b", "a", "r", "y", "ENTER"])
+        self.assertEqual(app.watch.typed, "sessionary")
+
+    def test_a_longer_reading_is_not_deleted_again(self):
+        app, _ = make_app(("sessionary",))
+        keys = self._type_word(app, "sessionary", "ses", "sessionarys")
+        self.assertEqual(keys, list("sionary") + ["ENTER"])
+
+    def _type_with_live_screen(self, app, word, prompt, extra, drop_backspace=0):
+        """Like the game: the board follows the keys, with ``extra`` typed after the last letter."""
+        keys = []
+        state = {"text": prompt, "clock": time.monotonic(), "pending_extra": extra,
+                 "drop": drop_backspace}
+
+        def publish():
+            state["clock"] += 0.05
+            text = state["text"]
+            app._last_frame = {"prompt": text, "full": True, "row_complete": True,
+                               "tiles": len(text), "captured_at": state["clock"] + 10}
+
+        def tap(kind, key, hold):
+            keys.append("\b" if kind == "back" else key)
+            if kind == "back":
+                if state["drop"]:
+                    state["drop"] -= 1
+                else:
+                    state["text"] = state["text"][:-1]
+            elif key:
+                state["text"] += key
+                if state["text"] == word and state["pending_extra"]:
+                    state["text"] += state["pending_extra"]
+                    state["pending_extra"] = ""
+            publish()
+
+        class Clock:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                publish()
+                return False
+
+        with patch.object(app_module, "focus_roblox", return_value=True), \
+             patch.object(app_module, "roblox_focused", return_value=True), \
+             patch.object(app_module, "tap_key", side_effect=tap), \
+             patch.object(app_module, "press_enter", side_effect=lambda: keys.append("ENTER")):
+            app._typing_prompt = prompt
+            app._type_suffix(app._gen, word, app_module.edit_plan("", word[len(prompt):]), Clock())
+            while not app._queue.empty():
+                app._process_event(*app._queue.get_nowait())
+        return keys, state["text"]
+
+    def test_a_doubled_last_letter_is_deleted_before_enter(self):
+        app, _ = make_app(("leet",))
+        keys, text = self._type_with_live_screen(app, "leet", "lee", "t")
+        self.assertEqual(keys, ["t", "\b", "ENTER"])
+        self.assertEqual(text, "leet")
+        self.assertEqual(app.watch.typed, "leet")
+
+    def test_a_dropped_backspace_is_repeated_until_the_row_is_exact(self):
+        app, _ = make_app(("leet",))
+        keys, text = self._type_with_live_screen(app, "leet", "lee", "t", drop_backspace=1)
+        self.assertEqual(keys, ["t", "\b", "\b", "ENTER"])
+        self.assertEqual(text, "leet")
+
+    def test_a_refused_row_with_a_stray_key_does_not_blacklist_the_real_word(self):
+        app, _ = make_app(("leet", "leets"))
+        app._typing_prompt = app.watch.played = "lee"
+        app._last_frame = {"prompt": "leett", "full": True, "row_complete": True, "tiles": 5,
+                           "captured_at": time.monotonic()}
+        with patch.object(app, "_launch_typing"), patch.object(app, "_cancel_typing"):
+            app._schedule_retry("leet", used=False)
+        self.assertNotIn("leet", app.engine.rejected_words)
+
+    def test_an_unread_row_is_not_typed_a_second_time(self):
+        app, _ = make_app(("sessionary",))
+        keys = self._type_word(app, "sessionary", "ses", "ses")
+        self.assertEqual(keys, list("sionary") + ["ENTER"])
+
+    def test_a_late_full_reading_cancels_the_repair(self):
+        app, _ = make_app(("sessionary",))
+
+        def show_full():
+            app._last_frame = {
+                "prompt": "sessionary",
+                "full": True,
+                "row_complete": True,
+                "tiles": len("sessionary"),
+                "captured_at": time.monotonic() + 10,
+            }
+
+        keys = self._type_word(app, "sessionary", "ses", "sessionar", show_full)
+        self.assertEqual(keys, list("sionary") + ["ENTER"])
+
+    def test_the_only_enter_is_on_the_finished_word(self):
         for seed in range(200):
-            plan = turn_plan("esslerising", "n", 12, random.Random(seed).random, lambda w: False)
-            counts.append(sum(step.kind == "early" for step in plan.steps))
-            self.assertEqual(plan.steps[-1].kind, "enter")
-            self.assertEqual(plan.steps[-1].typed, "esslerising")
-        self.assertGreater(sum(counts), 0)
-        self.assertGreater(counts.count(0), 160)
-        self.assertLessEqual(max(counts), 1)
-        for seed in range(200):
-            plan = turn_plan("esslerising", "n", 12, random.Random(seed).random, lambda w: True)
-            self.assertFalse(any(step.kind == "early" for step in plan.steps))
+            for word_check in (lambda w: False, lambda w: True):
+                plan = turn_plan("esslerising", "n", 12, random.Random(seed).random, word_check)
+                shown = ""
+                submitted = []
+                for step in plan.steps:
+                    if step.kind == "type":
+                        shown += step.key
+                    elif step.kind == "back" and shown:
+                        shown = shown[:-1]
+                    elif step.kind == "enter":
+                        submitted.append(shown)
+                self.assertEqual(submitted, ["esslerising"])
+                self.assertEqual(plan.steps[-1].kind, "enter")
+                self.assertEqual(plan.steps[-1].typed, "esslerising")
 
 
 class PauseAndPhaseTests(unittest.TestCase):
@@ -233,8 +424,7 @@ class PauseAndPhaseTests(unittest.TestCase):
             self.assertFalse(watch.observe("e", "ours", now=1.1 + i * .02)["play"])
         watch.observe("e", "theirs", now=1.3)
         watch.observe("elm", "theirs", now=1.4)
-        self.assertFalse(watch.observe("m", "ours", now=1.5)["play"])
-        self.assertEqual(watch.observe("m", "ours", now=1.6)["play"], "m")
+        self.assertEqual(watch.observe("m", "ours", now=1.5)["play"], "m")
 
     def test_word_ending_in_its_own_prefix_is_not_rejected_during_header_lag(self):
         watch = BoardWatch()
@@ -277,6 +467,8 @@ class PauseAndPhaseTests(unittest.TestCase):
         app.watch.rearm("like", time.monotonic())
         app._shown = "like"
         app._handle_frame(frame("ism"))
+        # Shorter than the prompt played before it, so it has to stay on screen.
+        time.sleep(0.32)
         app._handle_frame(frame("ism"))
         app._start_typing.assert_called_once_with("ism")
         self.assertIn("ismaticalness", face.values["C1"])
@@ -363,7 +555,7 @@ class PauseAndPhaseTests(unittest.TestCase):
 
     def test_phase_follows_actual_prefix_and_traps_match_the_next_prompt_length(self):
         traps = TrapPools(casual_2=["xy"], casual_3=["zzz"], casual_4=["tone"])
-        words = ["atone", "axy", "azzz", "aaaaaaaaaa", "xyz", "zzzz", "tones",
+        words = ["atone", "axy", "azzz", "aaaaaaaaaa", "xyzzyva", "zzzz", "tones",
                  "abtone", "abzzz", "abxy"]
         engine = Dyoe2Engine(words, traps, validate_giveable=False)
         engine.cancelled_prompts.clear()

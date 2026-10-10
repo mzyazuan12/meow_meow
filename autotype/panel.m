@@ -51,6 +51,8 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 @property (nonatomic, strong) NSButton *proButton;
 @property (nonatomic, strong) NSButton *spamButton;
 @property (nonatomic, strong) NSTextField *spamCaption;
+@property (nonatomic, strong) NSButton *spamCasualButton;
+@property (nonatomic, strong) NSButton *spamProButton;
 @property (nonatomic, strong) NSTextField *spamField;
 @property (nonatomic, strong) NSTextField *phaseLabel;
 @property (nonatomic, strong) NSTextField *turnLabel;
@@ -66,6 +68,10 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 @property (nonatomic, strong) NSButton *armButton;
 @property (nonatomic, strong) NSButton *pauseButton;
 @property (nonatomic, strong) NSButton *confirmButton;
+@property (nonatomic, strong) NSTextField *addField;
+@property (nonatomic, strong) NSTextField *searchField;
+@property (nonatomic, strong) NSTextField *kicker;
+@property (nonatomic, strong) NSButton *addButton;
 @property (nonatomic, strong) NSTextView *logView;
 @property (nonatomic) BOOL casual;
 @property (nonatomic) BOOL armed;
@@ -90,7 +96,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     self.casual = YES;
     NSRect screen = [NSScreen mainScreen].visibleFrame;
     CGFloat width = 420;
-    CGFloat height = 700;
+    CGFloat height = 780;
     NSRect frame = NSMakeRect(NSMaxX(screen) - width - 28, NSMinY(screen) + 36, width, height);
     self.window = [[NSPanel alloc] initWithContentRect:frame
                                                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskNonactivatingPanel
@@ -108,27 +114,28 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     root.layer.backgroundColor = inkColor().CGColor;
 
     self.usedLabel = label(@"USED 0", 11, mutedColor(), YES);
-    self.usedLabel.frame = NSMakeRect(250, 658, 150, 18);
+    self.usedLabel.frame = NSMakeRect(250, 738, 150, 18);
     self.usedLabel.alignment = NSTextAlignmentRight;
     [root addSubview:self.usedLabel];
 
     NSTextField *title = label(@"LAST LETTER", 22, boneColor(), NO);
-    title.frame = NSMakeRect(18, 650, 230, 30);
+    title.frame = NSMakeRect(18, 730, 230, 30);
     [root addSubview:title];
 
     NSTextField *kicker = label(@"DYOE   ·   FEATHERINE", 11, mutedColor(), YES);
-    kicker.frame = NSMakeRect(18, 628, 384, 16);
+    kicker.frame = NSMakeRect(18, 708, 384, 16);
+    self.kicker = kicker;
     [root addSubview:kicker];
 
     self.statusLabel = label(@"LOADING DICTIONARY", 11, mutedColor(), YES);
-    self.statusLabel.frame = NSMakeRect(18, 608, 384, 16);
+    self.statusLabel.frame = NSMakeRect(18, 688, 384, 16);
     [root addSubview:self.statusLabel];
 
     NSTextField *you = label(@"YOU", 11, mutedColor(), YES);
-    you.frame = NSMakeRect(18, 574, 36, 20);
+    you.frame = NSMakeRect(18, 654, 36, 20);
     [root addSubview:you];
 
-    self.nameField = [[NSTextField alloc] initWithFrame:NSMakeRect(58, 570, 344, 28)];
+    self.nameField = [[NSTextField alloc] initWithFrame:NSMakeRect(58, 650, 344, 28)];
     self.nameField.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightMedium];
     self.nameField.textColor = boneColor();
     self.nameField.backgroundColor = cardColor();
@@ -138,19 +145,40 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     self.nameField.focusRingType = NSFocusRingTypeNone;
     [root addSubview:self.nameField];
 
-    self.casualButton = [self button:@"CASUAL" action:@selector(casual:) frame:NSMakeRect(18, 536, 124, 32) bg:boneColor() fg:inkColor()];
-    self.proButton = [self button:@"PRO" action:@selector(pro:) frame:NSMakeRect(148, 536, 124, 32) bg:cardColor() fg:boneColor()];
-    self.spamButton = [self button:@"SPAM" action:@selector(spam:) frame:NSMakeRect(278, 536, 124, 32) bg:cardColor() fg:boneColor()];
+    self.casualButton = [self button:@"CASUAL" action:@selector(casual:) frame:NSMakeRect(18, 616, 124, 32) bg:boneColor() fg:inkColor()];
+    self.proButton = [self button:@"PRO" action:@selector(pro:) frame:NSMakeRect(148, 616, 124, 32) bg:cardColor() fg:boneColor()];
+    self.spamButton = [self button:@"SPAM" action:@selector(spam:) frame:NSMakeRect(278, 616, 124, 32) bg:cardColor() fg:boneColor()];
     [root addSubview:self.casualButton];
     [root addSubview:self.proButton];
     [root addSubview:self.spamButton];
 
-    self.spamCaption = label(@"HYBRID SUFFIXES", 11, mutedColor(), YES);
-    self.spamCaption.frame = NSMakeRect(18, 508, 384, 16);
+    self.searchField = [[NSTextField alloc] initWithFrame:NSMakeRect(18, 580, 384, 28)];
+    self.searchField.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightMedium];
+    self.searchField.textColor = boneColor();
+    self.searchField.backgroundColor = cardColor();
+    self.searchField.delegate = self;
+    self.searchField.bezeled = NO;
+    self.searchField.drawsBackground = YES;
+    self.searchField.focusRingType = NSFocusRingTypeNone;
+    self.searchField.placeholderString = @"search a prompt, e.g. elet";
+    self.searchField.wantsLayer = YES;
+    self.searchField.layer.borderWidth = 1;
+    self.searchField.layer.borderColor = lineColor().CGColor;
+    [root addSubview:self.searchField];
+
+    self.spamCaption = label(@"ENDINGS FIRST", 11, mutedColor(), YES);
+    self.spamCaption.frame = NSMakeRect(18, 552, 160, 16);
     self.spamCaption.hidden = YES;
     [root addSubview:self.spamCaption];
 
-    self.spamField = [[NSTextField alloc] initWithFrame:NSMakeRect(18, 476, 384, 28)];
+    self.spamCasualButton = [self button:@"CASUAL" action:@selector(spamCasual:) frame:NSMakeRect(186, 548, 104, 24) bg:boneColor() fg:inkColor()];
+    self.spamProButton = [self button:@"PRO" action:@selector(spamPro:) frame:NSMakeRect(296, 548, 106, 24) bg:cardColor() fg:boneColor()];
+    self.spamCasualButton.hidden = YES;
+    self.spamProButton.hidden = YES;
+    [root addSubview:self.spamCasualButton];
+    [root addSubview:self.spamProButton];
+
+    self.spamField = [[NSTextField alloc] initWithFrame:NSMakeRect(18, 520, 384, 28)];
     self.spamField.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightMedium];
     self.spamField.textColor = boneColor();
     self.spamField.backgroundColor = cardColor();
@@ -166,16 +194,16 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     [root addSubview:self.spamField];
 
     self.phaseLabel = label(@"R1   ·   PHASE 1", 12, boneColor(), YES);
-    self.phaseLabel.frame = NSMakeRect(18, 496, 384, 18);
+    self.phaseLabel.frame = NSMakeRect(18, 540, 384, 18);
     [root addSubview:self.phaseLabel];
 
     self.turnLabel = label(@"WAITING", 12, boneColor(), YES);
-    self.turnLabel.frame = NSMakeRect(18, 474, 228, 18);
+    self.turnLabel.frame = NSMakeRect(18, 518, 228, 18);
     [root addSubview:self.turnLabel];
-    self.confirmButton = [self button:@"It's your turn?" action:@selector(confirm:) frame:NSMakeRect(250, 470, 152, 26) bg:cardColor() fg:boneColor()];
+    self.confirmButton = [self button:@"It's your turn?" action:@selector(confirm:) frame:NSMakeRect(250, 514, 152, 26) bg:cardColor() fg:boneColor()];
     [root addSubview:self.confirmButton];
 
-    NSView *card = [[NSView alloc] initWithFrame:NSMakeRect(18, 168, 384, 296)];
+    NSView *card = [[NSView alloc] initWithFrame:NSMakeRect(18, 212, 384, 296)];
     self.cardView = card;
     card.wantsLayer = YES;
     card.layer.backgroundColor = cardColor().CGColor;
@@ -210,14 +238,32 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
         [card addSubview:view];
     }
 
-    self.armButton = [self button:@"ARM" action:@selector(arm:) frame:NSMakeRect(18, 118, 124, 36) bg:cardColor() fg:boneColor()];
-    self.pauseButton = [self button:@"PAUSE" action:@selector(pause:) frame:NSMakeRect(148, 118, 124, 36) bg:cardColor() fg:boneColor()];
-    self.resetButton = [self button:@"NEW GAME" action:@selector(newGame:) frame:NSMakeRect(278, 118, 124, 36) bg:cardColor() fg:boneColor()];
+    self.armButton = [self button:@"ARM" action:@selector(arm:) frame:NSMakeRect(18, 162, 124, 36) bg:cardColor() fg:boneColor()];
+    self.pauseButton = [self button:@"PAUSE" action:@selector(pause:) frame:NSMakeRect(148, 162, 124, 36) bg:cardColor() fg:boneColor()];
+    self.resetButton = [self button:@"NEW GAME" action:@selector(newGame:) frame:NSMakeRect(278, 162, 124, 36) bg:cardColor() fg:boneColor()];
     [root addSubview:self.armButton];
     [root addSubview:self.pauseButton];
     [root addSubview:self.resetButton];
 
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(18, 16, 384, 92)];
+    self.addField = [[NSTextField alloc] initWithFrame:NSMakeRect(18, 18, 290, 28)];
+    self.addField.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightMedium];
+    self.addField.textColor = boneColor();
+    self.addField.backgroundColor = cardColor();
+    self.addField.delegate = self;
+    self.addField.target = self;
+    self.addField.action = @selector(addWords:);
+    self.addField.bezeled = NO;
+    self.addField.drawsBackground = YES;
+    self.addField.focusRingType = NSFocusRingTypeNone;
+    self.addField.placeholderString = @"missing words";
+    self.addField.wantsLayer = YES;
+    self.addField.layer.borderWidth = 1;
+    self.addField.layer.borderColor = lineColor().CGColor;
+    [root addSubview:self.addField];
+    self.addButton = [self button:@"ADD" action:@selector(addWords:) frame:NSMakeRect(316, 16, 86, 32) bg:cardColor() fg:boneColor()];
+    [root addSubview:self.addButton];
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(18, 60, 384, 92)];
     self.logScroll = scroll;
     scroll.drawsBackground = NO;
     scroll.hasVerticalScroller = YES;
@@ -269,9 +315,13 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     else if ([key isEqualToString:@"NAME"] && ![self.nameField.stringValue isEqualToString:value]) self.nameField.stringValue = value;
     else if ([key isEqualToString:@"MODE"]) [self showMode:value];
     else if ([key isEqualToString:@"SPAMTEXT"] && ![self.spamField.stringValue isEqualToString:value]) self.spamField.stringValue = value;
+    else if ([key isEqualToString:@"SPAMBASE"]) [self showSpamBase:value];
     else if ([key isEqualToString:@"ARMED"]) [self showArmed:[value isEqualToString:@"1"]];
     else if ([key isEqualToString:@"ARMLABEL"]) styleButton(self.armButton, value, self.armed ? boneColor() : cardColor(), self.armed ? inkColor() : boneColor());
     else if ([key isEqualToString:@"PAUSELABEL"]) styleButton(self.pauseButton, value, cardColor(), boneColor());
+    else if ([key isEqualToString:@"STYLE"]) self.kicker.stringValue = value.length ? value : @"DYOE   ·   FEATHERINE";
+    else if ([key isEqualToString:@"SEARCHTEXT"] && ![self.searchField.stringValue isEqualToString:value]) self.searchField.stringValue = value ?: @"";
+    else if ([key isEqualToString:@"ADDTEXT"]) self.addField.stringValue = value ?: @"";
 }
 
 - (void)showPrompt:(NSString *)value {
@@ -304,32 +354,44 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     [self layoutForSpam:spam];
 }
 
+- (void)showSpamBase:(NSString *)base {
+    BOOL pro = [base isEqualToString:@"PRO"];
+    styleButton(self.spamCasualButton, @"CASUAL", pro ? cardColor() : boneColor(), pro ? boneColor() : inkColor());
+    styleButton(self.spamProButton, @"PRO", pro ? boneColor() : cardColor(), pro ? inkColor() : boneColor());
+}
+
 - (void)layoutForSpam:(BOOL)spam {
     self.spamCaption.hidden = !spam;
     self.spamField.hidden = !spam;
+    self.spamCasualButton.hidden = !spam;
+    self.spamProButton.hidden = !spam;
     if (spam) {
-        self.logScroll.frame = NSMakeRect(18, 16, 384, 52);
-        self.armButton.frame = NSMakeRect(18, 76, 124, 36);
-        self.pauseButton.frame = NSMakeRect(148, 76, 124, 36);
-        self.resetButton.frame = NSMakeRect(278, 76, 124, 36);
-        self.cardView.frame = NSMakeRect(18, 122, 384, 296);
-        self.turnLabel.frame = NSMakeRect(18, 428, 228, 18);
-        self.confirmButton.frame = NSMakeRect(250, 424, 152, 26);
-        self.phaseLabel.frame = NSMakeRect(18, 450, 384, 18);
-        self.spamField.frame = NSMakeRect(18, 476, 384, 28);
-        self.spamCaption.frame = NSMakeRect(18, 508, 384, 16);
+        self.logScroll.frame = NSMakeRect(18, 60, 384, 52);
+        self.armButton.frame = NSMakeRect(18, 120, 124, 36);
+        self.pauseButton.frame = NSMakeRect(148, 120, 124, 36);
+        self.resetButton.frame = NSMakeRect(278, 120, 124, 36);
+        self.cardView.frame = NSMakeRect(18, 166, 384, 296);
+        self.turnLabel.frame = NSMakeRect(18, 472, 228, 18);
+        self.confirmButton.frame = NSMakeRect(250, 468, 152, 26);
+        self.phaseLabel.frame = NSMakeRect(18, 494, 384, 18);
+        self.spamField.frame = NSMakeRect(18, 520, 384, 28);
+        self.spamCaption.frame = NSMakeRect(18, 552, 160, 16);
+        self.spamCasualButton.frame = NSMakeRect(186, 548, 104, 24);
+        self.spamProButton.frame = NSMakeRect(296, 548, 106, 24);
         [self.window.contentView addSubview:self.spamCaption];
+        [self.window.contentView addSubview:self.spamCasualButton];
+        [self.window.contentView addSubview:self.spamProButton];
         [self.window.contentView addSubview:self.spamField];
         [self.window makeFirstResponder:self.spamField];
     } else {
-        self.logScroll.frame = NSMakeRect(18, 16, 384, 92);
-        self.armButton.frame = NSMakeRect(18, 118, 124, 36);
-        self.pauseButton.frame = NSMakeRect(148, 118, 124, 36);
-        self.resetButton.frame = NSMakeRect(278, 118, 124, 36);
-        self.cardView.frame = NSMakeRect(18, 168, 384, 296);
-        self.turnLabel.frame = NSMakeRect(18, 474, 228, 18);
-        self.confirmButton.frame = NSMakeRect(250, 470, 152, 26);
-        self.phaseLabel.frame = NSMakeRect(18, 496, 384, 18);
+        self.logScroll.frame = NSMakeRect(18, 60, 384, 92);
+        self.armButton.frame = NSMakeRect(18, 162, 124, 36);
+        self.pauseButton.frame = NSMakeRect(148, 162, 124, 36);
+        self.resetButton.frame = NSMakeRect(278, 162, 124, 36);
+        self.cardView.frame = NSMakeRect(18, 212, 384, 296);
+        self.turnLabel.frame = NSMakeRect(18, 518, 228, 18);
+        self.confirmButton.frame = NSMakeRect(250, 514, 152, 26);
+        self.phaseLabel.frame = NSMakeRect(18, 540, 384, 18);
     }
 }
 
@@ -343,14 +405,25 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 - (void)casual:(id)sender { [self send:@"CASUAL"]; }
 - (void)pro:(id)sender { [self send:@"PRO"]; }
 - (void)spam:(id)sender { [self send:@"SPAM"]; }
+- (void)spamCasual:(id)sender { [self send:@"SPAMBASE\tCASUAL"]; }
+- (void)spamPro:(id)sender { [self send:@"SPAMBASE\tPRO"]; }
 - (void)newGame:(id)sender { [self send:@"NEW"]; }
 - (void)confirm:(id)sender { [self send:@"CONFIRM"]; }
+
+- (void)addWords:(id)sender {
+    NSString *raw = [self.addField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!raw.length) return;
+    raw = [[raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] componentsJoinedByString:@" "];
+    [self send:[NSString stringWithFormat:@"ADDWORDS\t%@", raw]];
+}
 
 - (void)controlTextDidChange:(NSNotification *)note {
     if (note.object == self.spamField) {
         [self send:[NSString stringWithFormat:@"SPAMTEXT\t%@", self.spamField.stringValue ?: @""]];
     } else if (note.object == self.nameField) {
         [self send:[NSString stringWithFormat:@"NAME\t%@", self.nameField.stringValue ?: @""]];
+    } else if (note.object == self.searchField) {
+        [self send:[NSString stringWithFormat:@"SEARCH\t%@", self.searchField.stringValue ?: @""]];
     }
 }
 

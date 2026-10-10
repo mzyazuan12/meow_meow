@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_LAST_TXT = REPO_ROOT / "lll-security-audit" / "last.txt"
+DEFAULT_LAST_TXT = REPO_ROOT / "dict (7).txt"
 DEFAULT_CASUAL_PREFIXES = (
     REPO_ROOT / "lll-security-audit" / "poppi" / "prefix-solve-groups-3-4-prefixes.txt"
 )
@@ -22,9 +22,75 @@ DEFAULT_CANCELLED_PROMPTS_PATH = (
     Path.home() / ".last-letter-helper" / "dyoe2_cancelled_prompts.json"
 )
 
-BLACKLISTED_TRAP_PREFIXES = frozenset({"bj"})
+# Prefixes the game will not accept as a prompt. A word is not played when the
+# ending it would hand over (the next prompt) is one of these.
+BLACKLISTED_TRAP_PREFIXES = frozenset({
+    "bj",
+    # A
+    "ah", "aj", "ak", "anda", "ande", "ay", "ady",
+    # B
+    "bd", "baa", "bs", "bsf", "bsh", "bskt",
+    # C
+    "ct", "cz", "caa", "ck", "cp", "cs", "cg", "cf",
+    # D
+    "dl", "db", "daa", "dy", "dc", "ddt", "dib", "dj", "dk", "dn", "ds", "dsr", "dt",
+    # E
+    "ery", "erl", "ek", "edh", "edhs", "eue", "eueu", "ead", "ec", "eb",
+    # F
+    "fy", "faa", "fj", "ft", "fth", "fthm", "ftn", "ftnc", "ftne",
+    # G
+    "gn", "gt", "gs", "gp", "gv", "gles", "ght", "gu",
+    # H
+    "haa", "hox", "hp", "ht", "hs", "hr",
+    # I
+    "ia", "iap", "ie", "if", "ih", "ij", "ini", "io", "iq", "ip", "irg", "irk",
+    "iu", "ive", "iw", "ix", "iz", "ish", "ig", "ishe", "ishes",
+    # J
+    "jb", "jf", "jg", "jl", "jm", "jn", "jq", "jt", "jx", "jr", "js",
+    # K
+    "kr", "ks", "kv", "kaa", "kh",
+    # L
+    "ls", "lf", "laa", "lb", "lc", "ld", "lm", "ln", "lp", "lr", "lt", "lly", "llyn", "ll",
+    # Doubled letters the game will not take as a prompt.
+    "bb", "cc", "dd", "gg", "hh", "rr", "ss",
+    # M
+    "mn", "mk", "ml", "mp", "mr", "ms", "mt",
+    # N
+    "nd", "ng", "nr", "ns", "nt", "naa", "naw", "nb", "nc", "nj", "np", "nv",
+    "nda", "nde", "ny",
+    # O
+    "oj", "oy", "ofa", "ofe", "onk", "oe", "oos", "oot", "oots", "oo",
+    # P
+    "pt", "paa", "pyv", "pyx", "pq", "pss", "poz", "pox", "psw", "ptg", "pty", "pst",
+    "psis", "ptp", "pts", "ptt", "pto", "ps", "pn",
+    # Q
+    "qn", "qy", "qh",
+    # R
+    "raa", "rc", "rb", "reaa", "ry", "rl", "rm", "rs", "rn", "rp", "rt", "rd", "rf", "rk",
+    # S
+    "sr", "saa", "sth", "shes",
+    # T
+    "tc", "tm", "tst", "tz", "taa", "td", "ty", "tl", "tn", "ts", "tion", "taum",
+    # U
+    "ubc", "ua", "uay", "uak", "uan", "ubb", "uc", "ud", "ue", "ueu", "ueue",
+    "ught", "ugh", "urs",
+    # V
+    "vaa", "vox", "vr", "vug", "vs",
+    # W
+    "ws", "waa", "wee", "wf", "wg", "wj", "wk", "wm", "wl", "wpm", "wc", "wy", "wu",
+    # X
+    "xr", "xc", "xd",
+    # Y
+    "ym", "yt", "yl", "yn", "yr", "ys", "yq", "yd", "yx",
+    # Z
+    "zs",
+    # Not a prompt at all.
+    "-",
+})
 
 _SPLIT_SUFFIXES = re.compile(r"[,;\s\[\](){}]+")
+# Same spellings the dictionary file keeps: letters, plus an apostrophe or hyphen between letters.
+_DICT_WORD = re.compile(r"^[a-z]+(?:['-][a-z]+)*$|^'[a-z]+(?:['-][a-z]+)*$")
 
 def resource_path(*parts: str) -> Path:
     return REPO_ROOT.joinpath(*parts)
@@ -410,6 +476,52 @@ class Dyoe2Engine:
             self.set_words(stream, traps=pools, validate_giveable=validate_giveable)
         return len(self.wordlist)
 
+    def add_known_words(self, raw_words: Iterable[str]) -> dict[str, list[str]]:
+        """Insert spellings into the live lists. Nothing is written to disk here."""
+        added: list[str] = []
+        already: list[str] = []
+        rejected: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_words:
+            word = (raw or "").strip().lower()
+            if not word or word in seen:
+                continue
+            seen.add(word)
+            if _DICT_WORD.fullmatch(word) is None:
+                rejected.append(word)
+                continue
+            if self._is_known_word(word):
+                already.append(word)
+                continue
+            index = bisect_left(self.wordlist, word)
+            self.wordlist.insert(index, word)
+            rev = word[::-1]
+            rev_index = bisect_left(self.reversed_words, rev)
+            self.reversed_words.insert(rev_index, rev)
+            added.append(word)
+        if added:
+            self._loaded = True
+            self.clear_cache()
+        return {"added": added, "already": already, "rejected": rejected}
+
+    def forget_known_words(self, words: Iterable[str]) -> None:
+        changed = False
+        for raw in words:
+            word = (raw or "").strip().lower()
+            if not word:
+                continue
+            index = bisect_left(self.wordlist, word)
+            if index < len(self.wordlist) and self.wordlist[index] == word:
+                del self.wordlist[index]
+                changed = True
+            rev = word[::-1]
+            rev_index = bisect_left(self.reversed_words, rev)
+            if rev_index < len(self.reversed_words) and self.reversed_words[rev_index] == rev:
+                del self.reversed_words[rev_index]
+                changed = True
+        if changed:
+            self.clear_cache()
+
     def clear_cache(self) -> None:
         self._ranked_cache_key = None
         self._ranked_cache = []
@@ -463,16 +575,39 @@ class Dyoe2Engine:
         idx = bisect_left(self.wordlist, word)
         return idx < len(self.wordlist) and self.wordlist[idx] == word
 
+    def prefix_has_play(self, prompt: str) -> bool:
+        """True when the prompt is a word or some allowed word continues it.
+
+        Stops at the first hit so a prompt check does not build the whole group.
+        """
+        lower = (prompt or "").strip().lower()
+        if not lower:
+            return False
+        if self._is_known_word(lower):
+            return True
+        start = bisect_left(self.wordlist, lower)
+        end = bisect_right(self.wordlist, lower + "\uffff")
+        for word in self.wordlist[start:end]:
+            if len(word) > len(lower) and self._is_allowed_word(word):
+                return True
+        return False
+
     def prefix_candidates(self, prompt: str) -> list[str]:
         lower = prompt.strip().lower()
         if not lower:
             return []
         start = bisect_left(self.wordlist, lower)
         end = bisect_right(self.wordlist, lower + "\uffff")
+        # Same test as _is_allowed_word, inlined: a one-letter prompt scans
+        # tens of thousands of words on the turn's critical path.
+        size = len(lower)
+        blocked = self.used_words | self.rejected_words
+        letters_only = self.casual_mode and not getattr(self, "allow_punctuation", False)
         return [
             word
             for word in self.wordlist[start:end]
-            if len(word) > len(lower) and self._is_allowed_word(word)
+            if len(word) > size and word not in blocked
+            and not (letters_only and word_has_punctuation(word))
         ]
 
     @staticmethod

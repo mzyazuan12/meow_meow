@@ -101,9 +101,14 @@ def run_capture(stop: threading.Event, on_frame, on_status, name_fn, paused_fn=N
         # One reader on every OS. The Mac grabber still uses the native
         # capture helper; letter and header recognition is shared.
         _run_portable(stop, on_frame, on_status, name_fn, paused_fn)
-    except (OSError, ImportError, AttributeError) as exc:
-        on_status("unsupported")
-        on_frame({"prompt": "", "header": "", "tiles": 0, "full": False, "error": str(exc)})
+    except Exception as exc:
+        # The session loop restarts this reader. A grab or recognition failure
+        # must not be the end of a long match.
+        try:
+            on_status("unsupported" if not roblox_running() else "hidden")
+            on_frame({"prompt": "", "header": "", "tiles": 0, "full": False, "error": str(exc)})
+        except Exception:
+            return
 
 def _shrink_rgba(raw: bytes, width: int, height: int, max_w: int = _FRAME_MAX):
     factor, tw, th = _fit_frame(width, height, max_w)
@@ -111,7 +116,14 @@ def _shrink_rgba(raw: bytes, width: int, height: int, max_w: int = _FRAME_MAX):
         return raw, width, height
     from PIL import Image
     image = Image.frombytes("RGBA", (width, height), raw)
-    return image.resize((tw, th), Image.Resampling.LANCZOS).tobytes(), tw, th
+    try:
+        resized = image.resize((tw, th), Image.Resampling.LANCZOS)
+        try:
+            return resized.tobytes(), tw, th
+        finally:
+            resized.close()
+    finally:
+        image.close()
 
 def _run_mac_native(stop: threading.Event, on_frame, on_status) -> None:
     from autotype.mac_input import roblox_running as mac_running
@@ -261,7 +273,7 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn
             # A malformed/transition frame must not kill capture mid-match.
             on_frame({"prompt": "", "header": "", "tiles": 0, "full": False,
                       "captured_at": captured_at, "capture_error": str(exc)})
-        stop.wait(0.015)
+        stop.wait(0.003)
 
 def _grab():
     if sys.platform == "win32":
@@ -547,9 +559,14 @@ def _grab_win():
     from PIL import Image
     return Image.frombytes("RGBA", (dst_w, dst_h), buf.raw, "raw", "BGRA").tobytes(), dst_w, dst_h
 
-def _grab_mac():
-    if not _CAP.is_file():
-        return None
+_MAC_GRAB = None
+
+
+def _mac_grabber():
+    """Load the screen grabber once. Reloading it on every frame leaks over a long match."""
+    global _MAC_GRAB
+    if _MAC_GRAB is not None:
+        return _MAC_GRAB
     lib = ctypes.CDLL(str(_CAP))
     lib.ll_grab.restype = ctypes.c_int
     lib.ll_grab.argtypes = [
@@ -559,6 +576,14 @@ def _grab_mac():
     ]
     libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
     libc.free.argtypes = [ctypes.c_void_p]
+    _MAC_GRAB = lib, libc
+    return _MAC_GRAB
+
+
+def _grab_mac():
+    if not _CAP.is_file():
+        return None
+    lib, libc = _mac_grabber()
     ptr = ctypes.POINTER(ctypes.c_ubyte)()
     width = ctypes.c_int()
     height = ctypes.c_int()
@@ -566,9 +591,12 @@ def _grab_mac():
         return None
     try:
         count = width.value * height.value * 4
+        if count <= 0 or not ptr:
+            return None
         return ctypes.string_at(ptr, count), width.value, height.value
     finally:
-        libc.free(ptr)
+        if ptr:
+            libc.free(ptr)
 
 def _linux_player_pid(pid: int) -> bool:
     try:
