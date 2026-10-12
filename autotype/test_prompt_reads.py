@@ -200,6 +200,8 @@ class ShuffledBoardTests(unittest.TestCase):
         app._handle_frame(frame("noi"))
         app._start_typing.assert_not_called()
         app._handle_frame(frame("noit"))
+        app._start_typing.assert_called_once_with("tion")
+        app.watch.played = "tion"  # the real typing launcher latches this
         app._handle_frame(frame("noit"))
         app._start_typing.assert_called_once_with("tion")
 
@@ -267,6 +269,8 @@ class OwnKeysTests(unittest.TestCase):
             app._handle_frame(frame("ingwees"))
             app._handle_frame(frame("ingwees"))
         clear.assert_called_once_with("ing")
+        # Erased, the row shuffles again; it is not "ng" a second time.
+        self.assertEqual(app._seen_as("fnig"), "ing")
 
     def test_a_doubled_key_is_not_taken_for_a_longer_prompt(self):
         app = self.typing_app(("leet", "leetle"), "lee", "t")

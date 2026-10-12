@@ -95,12 +95,12 @@ def request_keyboard_access() -> None:
         from autotype.mac_input import request_keyboard_access as mac
         mac()
 
-def run_capture(stop: threading.Event, on_frame, on_status, name_fn, paused_fn=None) -> None:
+def run_capture(stop: threading.Event, on_frame, on_status, name_fn, paused_fn=None, performance_fn=None) -> None:
 
     try:
         # One reader on every OS. The Mac grabber still uses the native
         # capture helper; letter and header recognition is shared.
-        _run_portable(stop, on_frame, on_status, name_fn, paused_fn)
+        _run_portable(stop, on_frame, on_status, name_fn, paused_fn, performance_fn)
     except Exception as exc:
         # The session loop restarts this reader. A grab or recognition failure
         # must not be the end of a long match.
@@ -234,10 +234,19 @@ def _parse_frame(line: str):
         "error": data.get("ERROR", ""),
     }
 
-def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn=None) -> None:
-    from autotype.tiles import scan_rgba
+# An unchanged screen is read again this often, so decisions that wait on
+# time still see it; in between, one frame is never read twice.
+REFRESH_NORMAL = 0.1
+REFRESH_HIGH = 0.03
+
+
+def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn=None, performance_fn=None) -> None:
+    from autotype.tiles import frame_array, scan_rgba
+    from autotype.fast_reader import BubbleReader
 
     last = ""
+    bubbles = None
+    read_at = 0.0
     while not stop.is_set():
         if paused_fn and paused_fn():
             stop.wait(0.025)
@@ -246,10 +255,15 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn
             on_status("unsupported" if roblox_running() else "down")
             stop.wait(0.5)
             continue
+        high = bool(performance_fn and performance_fn())
+        refresh = time.monotonic() - read_at >= (REFRESH_HIGH if high else REFRESH_NORMAL)
         try:
-            grabbed = _grab()
+            grabbed = _grab(refresh)
         except Exception:
             grabbed = None
+        if grabbed is SAME_FRAME:
+            stop.wait(0.001 if high else 0.002)
+            continue
         if grabbed is None:
             status = "hidden" if roblox_running() else "down"
             if status != last:
@@ -260,12 +274,19 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn
         if last != "up":
             last = "up"
             on_status("up")
-        captured_at = time.monotonic()
+        raw, width, height, captured_at = grabbed
+        del grabbed
+        read_at = time.monotonic()
         try:
-            raw, width, height = _shrink_rgba(*grabbed)
-            del grabbed
+            raw, width, height = _shrink_rgba(raw, width, height)
             started = time.perf_counter()
             frame = scan_rgba(raw, width, height, name_fn() if name_fn else "")
+            if high:
+                # The speech box over a player shows the word they entered.
+                bubbles = bubbles or BubbleReader()
+                frame["word_bubbles"] = bubbles.read(frame_array(raw, width, height))
+            else:
+                bubbles = None
             frame["ms"] = int((time.perf_counter() - started) * 1000)
             frame["captured_at"] = captured_at
             on_frame(frame)
@@ -273,14 +294,24 @@ def _run_portable(stop: threading.Event, on_frame, on_status, name_fn, paused_fn
             # A malformed/transition frame must not kill capture mid-match.
             on_frame({"prompt": "", "header": "", "tiles": 0, "full": False,
                       "captured_at": captured_at, "capture_error": str(exc)})
-        stop.wait(0.003)
+        if not high:
+            stop.wait(0.003)
 
-def _grab():
-    if sys.platform == "win32":
-        return _grab_win()
+# Returned by _grab when nothing has changed on screen since the last frame.
+SAME_FRAME = object()
+
+
+def _grab(refresh: bool = True):
+    """The newest Roblox frame as (rgba, width, height, captured_at).
+
+    None when Roblox can't be captured. The Mac stream returns SAME_FRAME
+    instead of a frame already read, unless ``refresh`` asks for it again.
+    """
     if sys.platform == "darwin":
-        return _grab_mac()
-    return _grab_linux()
+        return _grab_mac(refresh)
+    before = time.monotonic()
+    grabbed = _grab_win() if sys.platform == "win32" else _grab_linux()
+    return None if grabbed is None else (*grabbed, before)
 
 def _key_event(ch: str, hold: float) -> None:
     if sys.platform == "win32":
@@ -315,6 +346,9 @@ def _win_api():
         "GetDC": ([wt.HWND], wt.HDC),
         "ReleaseDC": ([wt.HWND, wt.HDC], ctypes.c_int),
         "VkKeyScanW": ([wt.WCHAR], ctypes.c_short),
+        "VkKeyScanExW": ([wt.WCHAR, wt.HANDLE], ctypes.c_short),
+        "GetKeyboardLayout": ([wt.DWORD], wt.HANDLE),
+        "MapVirtualKeyExW": ([wt.UINT, wt.UINT, wt.HANDLE], wt.UINT),
         "MapVirtualKeyW": ([wt.UINT, wt.UINT], wt.UINT),
         "SendInput": ([wt.UINT, ctypes.c_void_p, ctypes.c_int], wt.UINT),
     }
@@ -415,18 +449,30 @@ def _win_focus() -> bool:
     return user32.GetForegroundWindow() == hwnd
 
 def _win_key(ch: str, hold: float) -> None:
+    vk, modifiers = _win_vk(ch)
+    dead = (vk is not None and ch not in ("\n", "\b") and
+            _win_api()[0].MapVirtualKeyExW(vk, 2, _win_layout()) & 0x80000000)
+    if vk is None or dead:
+        _win_unicode(ch, hold)
+        return
+    down = []
+    try:
+        for bit, modifier in ((2, 0x11), (4, 0x12), (1, 0x10)):
+            if modifiers & bit:
+                _win_send(modifier, False)
+                down.append(modifier)
+        _win_send(vk, False)
+        down.append(vk)
+        if hold:
+            time.sleep(hold)
+    finally:
+        for key in reversed(down):
+            _win_send(key, True)
+
+def _win_layout():
     user32 = _win_api()[0]
-    vk, shift = _win_vk(ch)
-    if vk is None:
-        raise ValueError(f"Keyboard layout cannot type {ch!r}")
-    if shift:
-        _win_send(0x10, False)
-    _win_send(vk, False)
-    if hold:
-        time.sleep(hold)
-    _win_send(vk, True)
-    if shift:
-        _win_send(0x10, True)
+    thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+    return user32.GetKeyboardLayout(thread)
 
 def _win_vk(ch: str):
     user32 = _win_api()[0]
@@ -434,10 +480,10 @@ def _win_vk(ch: str):
         return 0x0D, False
     if ch == "\b":
         return 0x08, False
-    scanned = user32.VkKeyScanW(ch)
+    scanned = user32.VkKeyScanExW(ch, _win_layout())
     if scanned == -1:
         return None, False
-    return scanned & 0xFF, bool(scanned & 0x100)
+    return scanned & 0xFF, (scanned >> 8) & 7
 
 _WIN_INPUT = None
 
@@ -448,11 +494,11 @@ def _win_input_type():
 
     class MOUSEINPUT(ctypes.Structure):
         _fields_ = [
-            ("dx", ctypes.c_long),
-            ("dy", ctypes.c_long),
-            ("mouseData", ctypes.c_ulong),
-            ("dwFlags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
+            ("dx", ctypes.c_int32),
+            ("dy", ctypes.c_int32),
+            ("mouseData", ctypes.c_uint32),
+            ("dwFlags", ctypes.c_uint32),
+            ("time", ctypes.c_uint32),
             ("dwExtraInfo", ctypes.c_void_p),
         ]
 
@@ -460,14 +506,14 @@ def _win_input_type():
         _fields_ = [
             ("wVk", ctypes.c_ushort),
             ("wScan", ctypes.c_ushort),
-            ("dwFlags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_uint32),
+            ("time", ctypes.c_uint32),
             ("dwExtraInfo", ctypes.c_void_p),
         ]
 
     class HARDWAREINPUT(ctypes.Structure):
         _fields_ = [
-            ("uMsg", ctypes.c_ulong),
+            ("uMsg", ctypes.c_uint32),
             ("wParamL", ctypes.c_ushort),
             ("wParamH", ctypes.c_ushort),
         ]
@@ -476,23 +522,39 @@ def _win_input_type():
         _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
 
     class INPUT(ctypes.Structure):
-        _fields_ = [("type", ctypes.c_ulong), ("union", INPUT_UNION)]
+        _fields_ = [("type", ctypes.c_uint32), ("union", INPUT_UNION)]
 
     _WIN_INPUT = INPUT
     return INPUT
 
 def _win_send(vk: int, up: bool) -> None:
     user32 = _win_api()[0]
-    scan = user32.MapVirtualKeyW(vk, 0)
-    flags = 0x0008 | (0x0002 if up else 0)
+    scan = user32.MapVirtualKeyExW(vk, 4, _win_layout())
+    flags = (0x0008 if scan else 0) | (0x0002 if up else 0)
+    if scan & 0xFF00:
+        flags |= 0x0001
     input_type = _win_input_type()
     event = input_type()
     event.type = 1
     event.union.ki.wVk = vk
-    event.union.ki.wScan = scan
+    event.union.ki.wScan = scan & 0xFF
     event.union.ki.dwFlags = flags
     if user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) != 1:
         raise OSError(ctypes.get_last_error(), "Windows couldn't send a key to Roblox")
+
+def _win_unicode(ch: str, hold: float) -> None:
+    """Fallback for characters absent from the active physical keyboard map."""
+    user32 = _win_api()[0]
+    kind = _win_input_type()
+    for up in (False, True):
+        event = kind()
+        event.type = 1
+        event.union.ki.wScan = ord(ch)
+        event.union.ki.dwFlags = 0x0004 | (0x0002 if up else 0)
+        if user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) != 1:
+            raise OSError("Windows couldn't send the character to Roblox")
+        if not up and hold:
+            time.sleep(hold)
 
 def _grab_win():
     try:
@@ -568,32 +630,50 @@ def _mac_grabber():
     if _MAC_GRAB is not None:
         return _MAC_GRAB
     lib = ctypes.CDLL(str(_CAP))
+    pixels = ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte))
     lib.ll_grab.restype = ctypes.c_int
-    lib.ll_grab.argtypes = [
-        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.POINTER(ctypes.c_int),
-    ]
+    lib.ll_grab.argtypes = [pixels, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    try:
+        lib.ll_grab_next.restype = ctypes.c_int
+        lib.ll_grab_next.argtypes = [pixels, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                     ctypes.POINTER(ctypes.c_long), ctypes.POINTER(ctypes.c_double),
+                                     ctypes.c_int]
+        stream = True
+    except AttributeError:
+        stream = False
     libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
     libc.free.argtypes = [ctypes.c_void_p]
-    _MAC_GRAB = lib, libc
+    _MAC_GRAB = lib, libc, stream
     return _MAC_GRAB
 
 
-def _grab_mac():
+_MAC_FRAME = ctypes.c_long(0)
+
+
+def _grab_mac(refresh: bool = True):
     if not _CAP.is_file():
         return None
-    lib, libc = _mac_grabber()
+    lib, libc, stream = _mac_grabber()
     ptr = ctypes.POINTER(ctypes.c_ubyte)()
     width = ctypes.c_int()
     height = ctypes.c_int()
-    if not lib.ll_grab(ctypes.byref(ptr), ctypes.byref(width), ctypes.byref(height)):
+    age = ctypes.c_double()
+    before = time.monotonic()
+    if stream:
+        ok = lib.ll_grab_next(ctypes.byref(ptr), ctypes.byref(width), ctypes.byref(height),
+                              ctypes.byref(_MAC_FRAME), ctypes.byref(age), int(refresh))
+    else:
+        ok = lib.ll_grab(ctypes.byref(ptr), ctypes.byref(width), ctypes.byref(height))
+    if ok == 2:
+        return SAME_FRAME
+    if not ok:
         return None
     try:
         count = width.value * height.value * 4
         if count <= 0 or not ptr:
             return None
-        return ctypes.string_at(ptr, count), width.value, height.value
+        # The stream knows when the screen last showed this frame.
+        return ctypes.string_at(ptr, count), width.value, height.value, before - min(max(age.value, 0.0), 1.0)
     finally:
         if ptr:
             libc.free(ptr)
@@ -623,6 +703,14 @@ def _x_error(display, event):
     return 0
 
 
+class _XkbState(ctypes.Structure):
+    _fields_ = [("group", ctypes.c_ubyte), ("locked_group", ctypes.c_ubyte),
+                ("base_group", ctypes.c_ushort), ("latched_group", ctypes.c_ushort),
+                *[(name, ctypes.c_ubyte) for name in ("mods", "base_mods", "latched_mods",
+                  "locked_mods", "compat_state", "grab_mods", "compat_grab_mods",
+                  "lookup_mods", "compat_lookup_mods")], ("ptr_buttons", ctypes.c_ushort)]
+
+
 def _linux_display():
     try:
         x11 = ctypes.CDLL("libX11.so.6")
@@ -639,6 +727,8 @@ def _linux_display():
         "XRaiseWindow": ([ptr, window], ctypes.c_int),
         "XFlush": ([ptr], ctypes.c_int),
         "XKeysymToKeycode": ([ptr, ctypes.c_ulong], ctypes.c_uint),
+        "XkbKeycodeToKeysym": ([ptr, ctypes.c_uint, ctypes.c_int, ctypes.c_int], ctypes.c_ulong),
+        "XkbGetState": ([ptr, ctypes.c_uint, ctypes.POINTER(_XkbState)], ctypes.c_int),
         "XGetInputFocus": ([ptr, ctypes.POINTER(window), ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
         "XGetWindowAttributes": ([ptr, window, ptr], ctypes.c_int),
         "XGetImage": ([ptr, window, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int], ptr),
@@ -740,17 +830,42 @@ def _linux_key(ch: str, hold: float) -> None:
         keysym = ord(ch.lower())
     x11.XStringToKeysym.restype = ctypes.c_ulong
     code = x11.XKeysymToKeycode(display, keysym)
+    down = []
     try:
+        # XKeysymToKeycode alone doesn't press the modifiers needed on layouts
+        # where punctuation is shifted or on the AltGr level.
+        state = _XkbState()
+        if x11.XkbGetState(display, 0x100, ctypes.byref(state)) != 0:
+            raise OSError("X11 couldn't read the active keyboard layout")
+        def level_for(key):
+            return next((n for n in range(4)
+                         if x11.XkbKeycodeToKeysym(display, key, state.group, n) == keysym), None)
+        level = level_for(code) if code else None
+        if level is None:
+            # The first key returned may belong to an inactive layout group.
+            for candidate in range(8, 256):
+                level = level_for(candidate)
+                if level is not None:
+                    code = candidate
+                    break
+        if level is None:
+            raise OSError(f"The active X11 layout cannot type {ch!r}")
+        modifiers = ([0xFE03] if level >= 2 else []) + ([0xFFE1] if level % 2 else [])
+        for symbol in modifiers:
+            modifier = x11.XKeysymToKeycode(display, symbol)
+            if not modifier or not xtst.XTestFakeKeyEvent(display, modifier, True, 0):
+                raise OSError("X11 couldn't press the punctuation modifier")
+            down.append(modifier)
         if not code or not xtst.XTestFakeKeyEvent(display, code, True, 0):
             raise OSError("X11 couldn't send a key to Roblox")
+        down.append(code)
         x11.XFlush(display)
-        try:
-            if hold:
-                time.sleep(hold)
-        finally:
-            xtst.XTestFakeKeyEvent(display, code, False, 0)
-            x11.XFlush(display)
+        if hold:
+            time.sleep(hold)
     finally:
+        for key in reversed(down):
+            xtst.XTestFakeKeyEvent(display, key, False, 0)
+        x11.XFlush(display)
         x11.XCloseDisplay(display)
 
 def _grab_linux():

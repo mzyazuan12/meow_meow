@@ -753,22 +753,27 @@ def _error_events(prefix: str, suffix: str, rng: Callable[[], float],
 
 def turn_plan(suffix: str, prefix: str = "", budget: Optional[float] = None,
               rng: Optional[Callable[[], float]] = None,
-              is_word: Optional[Callable[[str], bool]] = None) -> AutotypePlan:
+              is_word: Optional[Callable[[str], bool]] = None, *,
+              immediate: bool = False) -> AutotypePlan:
     """Keys for one turn, ending with Enter straight after the last letter.
 
     Pace, fidgets and mistakes are all drawn per turn, and pace also drifts
     across a game. Spare time can add fidgets, then mistakes; they are dropped
     in that order, then the pace is raised to its floor, to finish inside
     ``budget`` seconds. The finished word is always what Enter submits.
+    ``immediate`` skips opening fidgets, pauses, and first-letter mistakes.
     """
     random_fn = rng or random.random
     budget = float("inf") if budget is None else max(0.0, budget)
     drift = _game_drift(random_fn) if rng is None else 1.0
     mean = _turn_mean(random_fn) * drift
     letters = _human_gaps(suffix, mean, random_fn)
-    acts, pauses = _fidget_acts(prefix, suffix, budget, random_fn)
-    reaction = _reaction(budget, acts, random_fn)
+    acts, pauses = ([], []) if immediate else _fidget_acts(prefix, suffix, budget, random_fn)
+    reaction = 0.0 if immediate else _reaction(budget, acts, random_fn)
     errors = _error_events(prefix, suffix, random_fn, is_word)
+    if immediate:
+        # Begin the actual answer at once; later keys keep their varied pace.
+        errors.pop(0, None)
     n = len(suffix)
 
     def gap_at(index: int, scale: float) -> float:

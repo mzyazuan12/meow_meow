@@ -81,6 +81,7 @@ class SubmissionTests(unittest.TestCase):
         app, _ = make_app(("ismailisms", "ismailism", "ismy"))
         app._name = "player"
         app._typing_prompt = app.watch.played = "ism"
+        app._last_frame = frame("ismailisms")
         with patch.object(app_module, "press_enter"):
             app._process_event("SUBMIT", (app._gen, "ismailisms", 7))
         with patch.object(app, "_launch_typing") as launch, patch.object(app, "_clear_input") as clear:
@@ -203,10 +204,11 @@ class SubmissionTests(unittest.TestCase):
         keys = []
         with patch.object(app_module, "tap_key", side_effect=lambda kind, key, hold: keys.append(key)), \
              patch.object(app_module, "press_enter", side_effect=lambda: keys.append("ENTER")), \
-             patch.object(app_module, "turn_plan", side_effect=lambda s, p, b, is_word=None:
+             patch.object(app_module, "turn_plan", side_effect=lambda s, p, b, is_word=None, **kwargs:
                           app_module.edit_plan("", s)):
             app._start_typing("e")
             app._typing_thread.join(timeout=3)
+            app._last_frame = frame("ecaboron")
             while not app._queue.empty():
                 app._process_event(*app._queue.get_nowait())
         self.assertEqual(keys, list("caboron") + ["ENTER"])
@@ -264,6 +266,10 @@ class SubmissionTests(unittest.TestCase):
 
         def tap(kind, key, hold):
             keys.append(key)
+            if planted:
+                text = app._last_frame["prompt"]
+                text = text[:-1] if kind == "back" else text + key
+                app._last_frame = dict(frame(text), row_complete=True, captured_at=time.monotonic() + 10)
             if board_after_last and key == word[-1] and not planted:
                 planted.append(True)
                 app._last_frame = {
@@ -560,6 +566,7 @@ class PauseAndPhaseTests(unittest.TestCase):
         engine = Dyoe2Engine(words, traps, validate_giveable=False)
         engine.cancelled_prompts.clear()
         session = MatchSession(engine)
+        session.set_mode("pro")
         session.round = 100
         self.assertEqual(phase_for_prompt(100, "abc"), 3)
         # A one-letter prompt hands over one letter; only the stage-change
@@ -643,6 +650,90 @@ class PauseAndPhaseTests(unittest.TestCase):
         self.assertTrue(app._erasing)
         self.assertFalse(app._resume_clear)
         self.assertEqual(app._input_length, 4)
+
+
+class NewMatchTests(unittest.TestCase):
+    def setUp(self):
+        self.app, _ = make_app(("stone", "store", "apple", "ankle", "tonal"))
+        del self.app._start_typing  # make_app stubs it; these tests need the real one
+        launch = patch.object(self.app, "_launch_typing")
+        self.launch = launch.start()
+        self.addCleanup(launch.stop)
+
+    def test_a_one_letter_prompt_after_longer_ones_keeps_used_words(self):
+        app = self.app
+        app._start_typing("st")
+        app.engine.mark_used("stone")
+        app.engine.mark_rejected("store")
+        app.session.given["ne"] = 1
+        style = app.session.style
+        app._start_typing("a")
+        self.assertEqual(app.engine.used_words, {"stone"})
+        self.assertEqual(app.engine.rejected_words, {"store"})
+        self.assertEqual(app.session.given, {"ne": 1})
+        self.assertIs(app.session.style, style)
+        self.assertEqual(self.launch.call_args.args[0], "a")
+        self.assertNotIn("stone", app.session.choices("st", 3))
+
+    def test_one_letter_prompts_of_the_same_game_keep_its_used_words(self):
+        app = self.app
+        app._start_typing("s")
+        app.engine.mark_used("stone")
+        app._start_typing("a")
+        self.assertIn("stone", app.engine.used_words)
+
+    def test_a_long_break_with_no_readable_turn_keeps_used_words(self):
+        app = self.app
+        app._start_typing("s")
+        app.engine.mark_used("stone")
+        with patch.object(app_module.time, "monotonic") as clock:
+            for second in range(121):
+                clock.return_value = 300.0 + second
+                app._handle_frame(dict(frame(""), header=""))
+        app._start_typing("t")
+        self.assertEqual(app.engine.used_words, {"stone"})
+
+    def test_roblox_disappearing_and_reconnecting_keeps_used_words(self):
+        app = self.app
+        app._start_typing("st")
+        app.engine.mark_used("stone")
+        for status in ("hidden", "up", "down", "up"):
+            app._apply_roblox(status)
+            self.assertEqual(app.engine.used_words, {"stone"})
+        app._start_typing("to")
+        self.assertEqual(app.engine.used_words, {"stone"})
+
+    def test_dictionary_loading_keeps_used_words_and_initializes_a_style(self):
+        app = self.app
+        app.engine.mark_used("stone")
+        app.engine.mark_rejected("store")
+        app.session.given["ne"] = 1
+        self.assertIsNone(app.session.style)
+        with patch.object(app.engine, "load_from_paths", return_value=5):
+            app._load()
+        self.assertEqual(app.engine.used_words, {"stone"})
+        self.assertEqual(app.engine.rejected_words, {"store"})
+        self.assertEqual(app.session.given, {"ne": 1})
+        self.assertIsNotNone(app.session.style)
+        style = app.session.style
+        with patch.object(app.engine, "load_from_paths", return_value=5):
+            app._load()
+        self.assertIs(app.session.style, style)
+        self.assertEqual(app.engine.used_words, {"stone"})
+
+    def test_only_the_new_game_action_clears_used_words_and_refreshes_the_count(self):
+        app = self.app
+        app.engine.mark_used("stone")
+        app.engine.mark_used("apple")
+        app.engine.mark_rejected("store")
+        app.session.given["ne"] = 1
+        app._refresh_used()
+        self.assertEqual(app.face.values["USED"], "USED 2")
+        self.assertTrue(app.handle("NEW", ""))
+        self.assertEqual(app.engine.used_words, set())
+        self.assertEqual(app.engine.rejected_words, set())
+        self.assertEqual(app.session.given, {})
+        self.assertEqual(app.face.values["USED"], "USED 0")
 
 
 if __name__ == "__main__":

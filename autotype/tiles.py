@@ -19,40 +19,41 @@ def label_runs(mask: np.ndarray, eight: bool = False):
     labels gives each run's component, numbered 0..count-1.
     """
     h, w = mask.shape
-    padded = np.zeros((h, w + 2), np.int8)
+    padded = np.zeros((h, w + 2), bool)
     padded[:, 1:-1] = mask
-    edges = np.diff(padded, axis=1)
-    ys, x0 = np.nonzero(edges == 1)
-    _ye, x1 = np.nonzero(edges == -1)
-    n = len(ys)
+    # Every row starts and ends unset, so its changes alternate start, end.
+    flips = np.flatnonzero(padded[:, 1:] != padded[:, :-1])
+    n = len(flips) // 2
     if not n:
         return np.zeros((0, 3), np.int64), np.zeros(0, np.int64), 0
-    parent = list(range(n))
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    starts = np.searchsorted(ys, np.arange(h + 1)).tolist()
-    xs0 = x0.tolist()
-    xs1 = x1.tolist()
+    ys, x0 = np.divmod(flips[0::2], w + 1)
+    x1 = flips[1::2] - ys * (w + 1)
+    # Runs in a row are disjoint and sorted, so the runs of the next row that
+    # touch run a form one contiguous index range [lo, hi).
     slack = 1 if eight else 0
-    for row in range(1, h):
-        a, a_end = starts[row - 1], starts[row]
-        b, b_end = starts[row], starts[row + 1]
-        while a < a_end and b < b_end:
-            if xs0[a] < xs1[b] + slack and xs0[b] < xs1[a] + slack:
-                ra, rb = find(a), find(b)
-                if ra != rb:
-                    parent[rb] = ra
-            if xs1[a] < xs1[b]:
-                a += 1
-            else:
-                b += 1
-    roots = [find(i) for i in range(n)]
-    _uniq, labels = np.unique(np.asarray(roots), return_inverse=True)
+    stride = w + 4
+    below = (ys + 1) * stride
+    lo = np.searchsorted(ys * stride + x1, below + x0 - slack, side="right")
+    hi = np.searchsorted(ys * stride + x0, below + x1 + slack, side="left")
+    counts = np.maximum(hi - lo, 0)
+    root = np.arange(n)
+    total = int(counts.sum())
+    if total:
+        a = np.repeat(root, counts)
+        b = np.repeat(lo - np.cumsum(counts) + counts, counts) + np.arange(total)
+        while True:
+            ra, rb = root[a], root[b]
+            live = ra != rb
+            if not live.any():
+                break
+            a, b, ra, rb = a[live], b[live], ra[live], rb[live]
+            np.minimum.at(root, np.maximum(ra, rb), np.minimum(ra, rb))
+            while True:
+                nxt = root[root]
+                if np.array_equal(nxt, root):
+                    break
+                root = nxt
+    _uniq, labels = np.unique(root, return_inverse=True)
     runs = np.stack([ys, x0, x1], axis=1)
     return runs, labels, int(labels.max()) + 1
 
@@ -118,14 +119,7 @@ def find_tiles(rgb: np.ndarray) -> List[Box]:
         cand.append((bx0 * step, y0 + by0 * step, bw * step, bh * step))
     # A letter's own white body is a small square inside its tile.
     outer = [b for b in cand if not any(o is not b and _inside(b, o) for o in cand)]
-    dark = None
-    kept = []
-    for box in outer:
-        if dark is None:
-            dark = _dark(rgb)
-        if _tile_border(dark, box):
-            kept.append(box)
-    kept.sort()
+    kept = sorted(box for box in outer if _tile_border(rgb, box))
     return _best_row(kept, width, rgb)
 
 
@@ -135,22 +129,21 @@ def _inside(inner: Box, outer: Box) -> bool:
             and inner[2] * inner[3] < outer[2] * outer[3])
 
 
-def _tile_border(dark: np.ndarray, box: Box) -> bool:
+def _tile_border(rgb: np.ndarray, box: Box) -> bool:
     x, y, w, h = box
-    height = dark.shape[0]
+    height = rgb.shape[0]
     inset = max(2, w // 8)
-    inner = dark[y + inset:y + h - inset, x + inset:x + w - inset]
+    inner = _dark(rgb[y + inset:y + h - inset, x + inset:x + w - inset])
     if inner.size and inner.mean() > 0.72:
         return False
-    above = dark[max(0, y - 4):y, x:x + w]
-    below = dark[y + h:min(height, y + h + 4), x:x + w]
+    above = _dark(rgb[max(0, y - 4):y, x:x + w])
+    below = _dark(rgb[y + h:min(height, y + h + 4), x:x + w])
     ring = np.concatenate([above.ravel(), below.ravel()])
     return bool(ring.size) and ring.mean() >= 0.125
 
 
 def _best_row(tiles: List[Box], width: int, rgb: Optional[np.ndarray] = None) -> List[Box]:
-    best: List[Box] = []
-    best_score = -1.0
+    rows = []
     for i, (x, y, w, h) in enumerate(tiles):
         # Score whole rows, never a more readable suffix of the same row.
         # Otherwise one uncertain letter near the start can make a long word
@@ -181,14 +174,23 @@ def _best_row(tiles: List[Box], width: int, rgb: Optional[np.ndarray] = None) ->
             row.append((nx, ny, nw, nh))
             last = nx + nw
         centre = (row[0][0] + last) / 2
+        place = 1.15 - abs(centre - width / 2) / max(1, width)
+        rows.append((len(row) ** 2 * w * h * 1.0 * place, i, row, w, h, place))
+    best: List[Box] = []
+    best_score, best_index = -1.0, -1
+    # A row scores its ceiling only when every tile reads, so rows whose
+    # ceiling is below the best score so far never need their glyphs read.
+    for ceiling, i, row, w, h, place in sorted(rows, key=lambda item: (-item[0], item[1])):
+        if ceiling < best_score:
+            break
         # Avatar text and controls can form square white components too. A
         # genuine outlined glyph must support the row before its size counts.
         readable = sum(bool(read_letter(rgb, box)) for box in row) if rgb is not None else len(row)
         if not readable:
             continue
-        score = readable ** 2 * w * h * (readable / len(row)) ** 3 * (1.15 - abs(centre - width / 2) / max(1, width))
-        if score > best_score:
-            best_score = score
+        score = readable ** 2 * w * h * (readable / len(row)) ** 3 * place
+        if score > best_score or (score == best_score and i < best_index):
+            best_score, best_index = score, i
             best = row
     return best
 
@@ -251,11 +253,22 @@ def header_lines(rgb: np.ndarray) -> List[List[Tuple[Box, Optional[np.ndarray], 
     max_h = max(8, int(height * 0.6))
     order = np.argsort(labels, kind="stable")
     bounds = np.searchsorted(labels[order], np.arange(count + 1))
+    widths, heights = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
+    integral = np.zeros((height + 1, width + 1), np.int32)
+    np.cumsum(np.cumsum(dark, axis=0, dtype=np.int32), axis=1, out=integral[1:, 1:])
+    ex0, ey0 = np.clip(boxes[:, 0] - 2, 0, width), np.clip(boxes[:, 1] - 2, 0, height)
+    ex1, ey1 = np.clip(boxes[:, 2] + 2, 0, width), np.clip(boxes[:, 3] + 2, 0, height)
+    near_dark = integral[ey1, ex1] - integral[ey0, ex1] - integral[ey1, ex0] + integral[ey0, ex0]
+    unclipped = (boxes[:, 0] >= 2) & (boxes[:, 1] >= 2) & (boxes[:, 2] + 2 <= width) & (boxes[:, 3] + 2 <= height)
+    # Each column and row of a component has two ring pixels past either end,
+    # so an unclipped ring holds at least 4 * max(w, h) pixels. Sky and cloud
+    # blobs without that much dark nearby can never pass the ring test below.
+    hopeless = unclipped & (near_dark < 0.45 * 4 * np.maximum(widths, heights))
+    candidates = ((boxes[:, 4] >= 3) & (heights <= max_h) & (heights >= 3)
+                  & (widths <= heights * 4 + 4) & ~hopeless)
     pieces = []
-    for index, (x0, y0, x1, y1, area) in enumerate(boxes.tolist()):
-        bw, bh = x1 - x0, y1 - y0
-        if area < 3 or bh > max_h or bh < 3 or bw > bh * 4 + 4:
-            continue
+    for index in np.flatnonzero(candidates).tolist():
+        x0, y0, x1, y1, _area = boxes[index].tolist()
         mask = _component_mask(runs[order[bounds[index]:bounds[index + 1]]], (x0, y0, x1, y1))
         pad = 2
         ex0, ey0 = max(0, x0 - pad), max(0, y0 - pad)
@@ -335,19 +348,27 @@ def read_header(rgb: np.ndarray) -> str:
     return " | ".join(text for text in texts if text)
 
 
-def header_band(rgb: np.ndarray) -> np.ndarray:
+def header_band(rgb: np.ndarray, row: Optional[List[Box]] = None) -> np.ndarray:
     height = rgb.shape[0]
-    return rgb[: max(8, int(height * 0.16))]
+    bottom = max(8, int(height * 0.16))
+    if row:
+        # The turn line is drawn above the prompt row, so tiles never belong to
+        # it, and typing must not invalidate the cached line. A row near the
+        # top leaves no room for the line above it; keep the usual band then.
+        top = min(b[1] for b in row) - max(3, max(b[3] for b in row) // 6)
+        if height * 0.06 <= top < bottom:
+            bottom = top
+    return rgb[:bottom]
 
 
 _HEADER_KEY: Optional[bytes] = None
 _HEADER_TEXT = ""
 
 
-def header_text(rgb: np.ndarray) -> str:
+def header_text(rgb: np.ndarray, row: Optional[List[Box]] = None) -> str:
     """Cached by the outlined-text pixels only, so a moving sky never re-reads."""
     global _HEADER_KEY, _HEADER_TEXT
-    band = header_band(rgb)
+    band = header_band(rgb, row)
     small = band[::2, ::2]
     lo = small.min(axis=2)
     hi = small.max(axis=2)
@@ -373,7 +394,6 @@ def row_is_clipped(rgb: np.ndarray, row: List[Box]) -> bool:
     # excludes it. Look for its remaining white body and border at the expected
     # row pitch before calling the remaining, fully visible tiles a whole word.
     pitch = float(np.median([b[0] - a[0] for a, b in zip(row, row[1:])])) if len(row) > 1 else row[0][2] * 1.125
-    dark = None
     for box, direction in ((row[0], -1), (row[-1], 1)):
         x, y, w, h = box
         nx = round(x + direction * pitch)
@@ -381,11 +401,8 @@ def row_is_clipped(rgb: np.ndarray, row: List[Box]) -> bool:
             continue
         left, right = max(0, nx), min(width, nx + w)
         partial = rgb[y:y + h, left:right]
-        if partial.size and _white(partial).mean() > 0.45:
-            if dark is None:
-                dark = _dark(rgb)
-            if _tile_border(dark, (left, y, right - left, h)):
-                return True
+        if partial.size and _white(partial).mean() > 0.45 and _tile_border(rgb, (left, y, right - left, h)):
+            return True
     return False
 
 
@@ -393,8 +410,8 @@ def scan_rgba(raw, width: int, height: int, name: str = "") -> dict:
     if width < 8 or height < 8 or len(raw) < width * height * 4:
         return {"prompt": "", "header": "", "tiles": 0, "ms": 0, "full": False}
     rgb = frame_array(raw, width, height)
-    header = header_text(rgb)
     row = find_tiles(rgb)
+    header = header_text(rgb, row)
     letters = [read_letter(rgb, box) or "?" for box in row]
     prompt = "".join(letters)
     clipped = row_is_clipped(rgb, row)

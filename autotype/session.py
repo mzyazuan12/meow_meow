@@ -125,6 +125,17 @@ SHORT_PROMPT_HOLD = 0.3
 # The same for a prompt worked out from a mirrored or shuffled row while it
 # could still gain a tile: "noi" is the start of "noit" ("tion" mirrored).
 DERIVED_HOLD = 0.12
+# A row inside their word but not at its end is usually still drawing ("bil"
+# of "bils"; each tile takes about a fifth of a second to land). Their word
+# can itself carry a letter they deleted before Enter, so a row that stays
+# this long is the prompt.
+PARTIAL_PROMPT_HOLD = 0.7
+# After our Enter the header can still name us over the ending we handed
+# over. A whole opponent turn can also pass unseen and end on that same
+# ending; once our name has stayed this long, the prompt is ours.
+AWAIT_TURN_HOLD = 1.2
+# A clipped read of a prompt being retried is not a new turn, unless it stays.
+CLIPPED_RETRY_HOLD = 0.5
 
 
 def _clean_word(text: str) -> str:
@@ -157,7 +168,7 @@ def _plausible_read(read: str, given: str, words: list) -> bool:
     """
     if given and read.startswith(given):
         return True
-    return any(word.endswith(read) or word.startswith(read) for word in words)
+    return any(read in word for word in words)
 
 
 class BoardWatch:
@@ -200,6 +211,17 @@ class BoardWatch:
         self._candidate_since = 0.0
         # Their word, prompt and readings, kept for the whole of our reply.
         self._context: Optional[Tuple[str, str, list]] = None
+        self._length_read = ""
+        self._length_since = 0.0
+        self._holds: dict[str, Tuple[str, float]] = {}
+
+    def _held(self, reason: str, board: str, seconds: float) -> bool:
+        """Whether ``board`` has stayed on screen ``seconds`` while ``reason`` held it back."""
+        since = self._holds.get(reason)
+        if since is None or since[0] != board:
+            self._holds[reason] = (board, self._clock)
+            return False
+        return self._clock - since[1] >= seconds
 
     def forget_partials(self) -> None:
         self._last_reads = []
@@ -243,12 +265,20 @@ class BoardWatch:
         self._last_reads = list(self._memory)
         # Keep the word they built. A later 1–4 letter prompt must not replace
         # it, but a backspaced correction longer than any prompt does.
-        if "?" not in board and (len(board) > 4 or len(board) >= len(self._opponent_word)):
+        growing = not self._given or board.startswith(self._given)
+        if ("?" not in board and (len(board) > 4 or len(board) >= len(self._opponent_word))
+                and (growing or len(self._opponent_word) <= len(self._given))):
             self._opponent_word = board
 
     @property
     def opponent_word(self) -> str:
         return self._opponent_word
+
+    def confirm_opponent(self, word: str) -> None:
+        """Keep a uniquely recovered word as evidence throughout our reply."""
+        self._opponent_word = _clean_word(word)
+        if self._context:
+            self._context = (self._opponent_word, self._context[1], self._context[2])
 
     def scramble_context(self) -> Optional[Tuple[str, str, list]]:
         """What a glitched prompt can be solved from, or None between turns.
@@ -263,7 +293,8 @@ class BoardWatch:
 
     @staticmethod
     def _prompt(board: str) -> str:
-        return board if re.fullmatch(r"[a-z'-]{1,4}", board) else ""
+        # Every prompt ends a word, so it holds a letter; "-''-" is scenery.
+        return board if re.fullmatch(r"(?=.*[a-z])[a-z'-]{1,4}", board) else ""
 
     def observe(self, board: str, whose: str, *, complete: bool = True,
                 tiles: int = 0, now: float | None = None, derived: bool = False) -> dict:
@@ -298,6 +329,7 @@ class BoardWatch:
                 self._candidate = ""
                 self._candidate_hits = 0
                 self._reject_hits = 0
+                self._holds.clear()
                 # A fast opponent can already have typed their whole answer
                 # in the very capture that confirms our Enter. Keep that frame.
                 if whose == "theirs":
@@ -354,6 +386,7 @@ class BoardWatch:
             self.turn = "theirs"
             self._candidate = ""
             self._candidate_hits = 0
+            self._holds.clear()
             self._remember(board)
             if complete and board:
                 self.pending = board
@@ -377,8 +410,45 @@ class BoardWatch:
         if self._await_opponent and prompt == self._given and not self._memory:
             # The board collapsed before the speaker changed. Repeated captures
             # of that same ending are still the opponent's starting prefix.
-            out.update(board=self.pending, partials=list(self._last_reads))
-            return out
+            if not self._held("await", prompt, AWAIT_TURN_HOLD):
+                out.update(board=self.pending, partials=list(self._last_reads))
+                return out
+        else:
+            self._holds.pop("await", None)
+
+        context = self.scramble_context()
+        given = context[1] if context else ""
+        lengths = prompt_lengths(max(len(given), self.floor))
+        word = self._opponent_word
+        if prompt and context and lengths:
+            # A collapsing word can leave an ordinary suffix such as "size"
+            # between "vmsize" and "ze". It is not a phase-2 prompt, nor a
+            # shuffle whose stray letters should be discarded.
+            if len(prompt) > max(lengths):
+                if self._length_read != prompt:
+                    self._length_read, self._length_since = prompt, self._clock
+                if self._clock - self._length_since < 0.20:
+                    self._candidate = ""
+                    self._candidate_hits = 0
+                    return out
+                # The remembered phase can itself be a half-drawn read. A
+                # complete longer row that stays must not lock up this turn.
+                self.floor = max(self.floor, len(prompt))
+            else:
+                self._length_read = ""
+            # "bil" can be entirely readable while the s of "bils" has not
+            # landed. Their word says more of this ending is still coming,
+            # unless that word kept a letter they deleted before Enter.
+            if (not derived and len(word) > len(prompt) and prompt in word
+                    and not word.endswith(prompt)):
+                if not self._held("partial", prompt, PARTIAL_PROMPT_HOLD):
+                    self._candidate = ""
+                    self._candidate_hits = 0
+                    return out
+                self._opponent_word = word[:word.rfind(prompt) + len(prompt)]
+                self._context = (self._opponent_word, context[1], context[2])
+            else:
+                self._holds.pop("partial", None)
 
         if self._opponent_active and prompt:
             if board == previous_board and self._given and len(board) > len(self._given):
@@ -438,18 +508,24 @@ class BoardWatch:
         if self._retry_prompt and prompt != self._retry_prompt and self._retry_prompt.startswith(prompt):
             # A clipped old prefix is not a new turn. An unrelated stable
             # prefix must still be allowed after a missed opponent boundary.
-            return out
+            if not self._held("clipped", prompt, CLIPPED_RETRY_HOLD):
+                return out
+            self._retry_prompt = ""
         if prompt == self._candidate:
             self._candidate_hits += 1
         else:
             self._candidate, self._candidate_hits = prompt, 1
             self._candidate_since = self._clock
         # The ending of the word they just typed already confirms this read;
-        # anything else waits for a second identical capture. A board already
-        # worked out from that word (unshuffled, unmirrored) is not a read.
+        # anything else waits for a second identical capture. Short boards
+        # worked out from that word can still gain a tile while drawing.
         word = self._opponent_word
         short = len(prompt) < self.floor
-        vouched = not derived and not short and len(word) > len(prompt) and word.endswith(prompt)
+        vouched = not short and len(word) > len(prompt) and word.endswith(prompt)
+        # A four-letter ending cannot gain another prompt tile. Once the
+        # opponent's word and all its letters agree, a corrected row is ready
+        # on the first capture too. Short transformed rows remain ambiguous.
+        vouched = vouched and (not derived or len(prompt) == 4)
         if self._candidate_hits < (1 if vouched else 2):
             return out
         held = self._clock - self._candidate_since
@@ -490,8 +566,14 @@ SECONDS_PER_LETTER = 0.18
 GIVEN_WEIGHT = 3
 PUNCTUATION_BONUS = 2
 EASY_PLURAL_PENALTY = 3
-# An ending with more playable answers than this is never treated as a trap.
+# An ending with more playable answers than this is never a pro trap.
 TRAP_SCAN = 40
+# Casual only hands a prefix that splits into at least this many next-letter
+# groups. Adding s, or es, is a plural and does not count as a group.
+CASUAL_MIN_GROUPS = 3
+# Stop counting once a prefix is this wide. It is still legal, and it ranks
+# behind every tighter casual prefix.
+CASUAL_GROUP_CAP = 9
 _TRAP_CHARS = re.compile(r"^[a-z'\-]+$")
 
 
@@ -625,6 +707,9 @@ class MatchSession:
         self._total_stamp: tuple = ()
         self.unreadable_words: set[str] = set()
         self.unreadable_prefixes: set[str] = set()
+        self._recent_traps: dict[str, int] = {}
+        self._recent_words: dict[str, int] = {}
+        self._stats_cache = {}
 
     def _allow_punctuation(self) -> None:
         # Casual is letters only. Pro, and spam set to pro, can still play - and '.
@@ -675,13 +760,19 @@ class MatchSession:
             self.engine.set_hybrid_suffixes(self.spam_suffixes)
             self._choice_cache_key = None
 
-    def new_game(self) -> None:
-        self.engine.clear_used()
-        self.unreadable_words.clear()
-        self.unreadable_prefixes.clear()
+    def roll_style(self) -> None:
+        """Choose a trap style without changing the recorded used words."""
         self.style = TrapStyle.roll(self.style)
         for casual in (True, False):
             self.engine.rotate_for_new_game(casual=casual, persist=False, shuffle=True)
+        self._choice_cache_key = None
+
+    def new_game(self) -> None:
+        # Called by the app only for the user's explicit NEW GAME action.
+        self.engine.clear_used()
+        self.unreadable_words.clear()
+        self.unreadable_prefixes.clear()
+        self.roll_style()
         self.round = 1
         self.last_prefix = ""
         self.engine.trap_phases = ()
@@ -958,16 +1049,20 @@ class MatchSession:
                 tried.add(head)
                 start = bisect_left(wordlist, head)
                 stop = bisect_right(wordlist, head + "\uffff")
+                pool = [w for w in wordlist[start:stop] if w not in used]
+                # Check clean fragments at every length BEFORE trying shorter
+                # shuffled endings. "size" from a clipped "vmsi" is an
+                # ordered part of vmsize, not "ze" plus two stray letters.
+                if _plausible_read(read, given, pool):
+                    return ""
                 if flipped:
-                    tails = {w[-len(read):] for w in wordlist[start:stop]
-                             if len(w) > len(read) and w not in used}
+                    tails = {w[-len(read):] for w in pool if len(w) > len(read)}
                     if read in tails:
                         return ""
                     if flipped in tails:
                         return flipped
                 for n in lengths:
-                    endings = {w[-n:] for w in wordlist[start:stop]
-                               if len(w) > n and w not in used and _fits(w[-n:], read)}
+                    endings = {w[-n:] for w in pool if len(w) > n and _fits(w[-n:], read)}
                     if read in endings:
                         # A word it can still be ends exactly so: "ts" after a
                         # clipped "abstrac" is clean, not a shuffled "st".
@@ -1003,14 +1098,15 @@ class MatchSession:
     def _trap_stats(self, trap: str, blocked: frozenset, letters_only: bool):
         """What handing ``trap`` over would leave the opponent; None if useless.
 
-        This reads the dictionary only. A trap is an ending with few answers
-        left, and long ones. Returns ``(left, value, easy_plural, shortest,
-        mean)`` where ``left`` is the answers still playable, ``value`` adds the
-        penalties for earlier hand-overs, and shortest/mean are how many
-        letters the opponent still has to type.
+        Pro: few answers left, and long ones. Casual: the next letter after the
+        prefix has to fall into at least three groups (``ary(b)``, ``ary(t)``,
+        ``ary(l)``). A group that is only ``+s`` or ``+es`` does not count, and
+        fewer than three groups is a pro ending, so casual will not hand it
+        over. Returns ``(left, value, easy_plural, shortest, mean, groups)``.
 
-        A prefix that starts or ends with - or ' can never be a prompt, and
-        one that is itself an unused word is answered by pressing Enter.
+        A prefix that starts or ends with - or ' can never be a prompt. One
+        that is itself an unused word is answered by pressing Enter, in either
+        mode.
         """
         engine = self.engine
         n = len(trap)
@@ -1024,32 +1120,54 @@ class MatchSession:
         wordlist = engine.wordlist
         start = bisect_left(wordlist, trap)
         stop = bisect_right(wordlist, trap + "\uffff")
-        solves = []
+        reaches: list[int] = []
+        seen: set[str] = set()
+        groups = 0
+        wide = False
+        easy_plural = False
         for index in range(start, stop):
             word = wordlist[index]
-            if len(word) > n and word not in blocked and not (letters_only and word_has_punctuation(word)):
-                solves.append(word)
-                if len(solves) > TRAP_SCAN:
-                    return None  # far too many answers to be a trap
-        if not solves:
+            if len(word) <= n or word in blocked or (letters_only and word_has_punctuation(word)):
+                continue
+            rest = word[n:]
+            if self.casual:
+                # The whole "+s" group, and any "+es..." continuation, is a plural.
+                if rest[0] == "s" or rest.startswith("es"):
+                    if rest in ("s", "es"):
+                        easy_plural = True
+                    continue
+                if rest[0] not in seen:
+                    seen.add(rest[0])
+                    groups += 1
+                    if groups > CASUAL_GROUP_CAP:
+                        wide = True
+                        break
+            elif len(reaches) > TRAP_SCAN:
+                return None  # far too many answers to be a pro trap
+            if rest in ("s", "es"):
+                easy_plural = True
+            reaches.append(len(rest))
+        if self.casual:
+            if wide:
+                groups = CASUAL_GROUP_CAP
+            elif groups < CASUAL_MIN_GROUPS:
+                return None
+        if not reaches:
             return None
         given = self.given.get(trap, 0)
-        left = len(solves)
+        left = len(reaches)
         if given:
             left = min(left, self._total_solves(trap) - given)
             if left <= 0:
                 return None
         # Each earlier hand-over of the same prefix consumed one of its answers
         # (even ones we never saw typed) and lowers its priority.
-        value = left + GIVEN_WEIGHT * given
+        value = (groups if self.casual else left) + GIVEN_WEIGHT * given
         if not self.casual and ("-" in trap or "'" in trap):
             value -= PUNCTUATION_BONUS
-        # Appending s/es to the prompt is an answer anyone finds at once.
-        easy_plural = any(w in (trap + "s", trap + "es") for w in solves)
         if easy_plural:
             value += EASY_PLURAL_PENALTY
-        reach = [len(w) - n for w in solves]
-        return (left, value, easy_plural, min(reach), sum(reach) / len(reach))
+        return (left, value, easy_plural, min(reaches), sum(reaches) / len(reaches), groups)
 
     def _spam_ranked(self, prefix: str, phase: int, cap: int, hurry: bool, size: int) -> list:
         """Typed endings first, then the same deadly traps casual or pro would play."""
@@ -1129,8 +1247,28 @@ class MatchSession:
 
         def trap_stats(trap: str):
             if trap not in stats:
-                stats[trap] = self._trap_stats(trap, blocked, letters_only)
+                cache_key = (trap, blocked, letters_only, self.casual, self.given.get(trap, 0),
+                             id(engine.wordlist), len(engine.wordlist))
+                if cache_key not in self._stats_cache:
+                    if len(self._stats_cache) >= 8192:
+                        self._stats_cache.clear()
+                    self._stats_cache[cache_key] = self._trap_stats(trap, blocked, letters_only)
+                stats[trap] = self._stats_cache[cache_key]
             return stats[trap]
+
+        pull = 0.65 + 0.45 * style.weight
+
+        def crowd(value: float) -> float:
+            # How many answers are left (pro) or next-letter groups (casual).
+            return math.log2(max(0.0, value) + 1)
+
+        def deadliness(value: float, shortest: int, mean: float) -> float:
+            # Lower is deadlier: few answers, and long ones.
+            return crowd(value) - pull * math.log2(1 + (shortest + mean) / 2)
+
+        # For each hand-over length this prompt can reach: the deadliest ending
+        # among those with about the fewest answers, and that fewest.
+        floor: dict[int, Tuple[float, float]] = {}
 
         def ending(word: str, n: int):
             if not n or len(word) <= n:
@@ -1139,27 +1277,32 @@ class MatchSession:
             info = trap_stats(trap)
             if info is None:
                 return None, None
-            left, value, easy, shortest, mean = info
+            left, value, easy, shortest, mean, groups = info
             if word.startswith(trap):
                 # The word itself is one of the trap's answers; it won't be left.
                 left -= 1
                 value -= 1
                 if left <= 0:
                     return None, None
-            # Few answers left and long ones: the lower, the deadlier. A hyphen
-            # or apostrophe trap ranks ahead of a plain one. Traps inside the
-            # same band are equally deadly this game; a favoured trap beats an
-            # unfavoured one a band closer. The curated list only prefers a
-            # trap when the dictionary rates it the same as another.
-            span = (shortest + mean) / 2
-            pull = 0.65 + 0.45 * style.weight
-            quality = math.log2(max(0.0, value) + 1) - pull * math.log2(1 + span)
-            band = math.floor(quality / style.width)
-            if not style.favours(trap):
-                band += 1
-            marked = 0 if ("-" in trap or "'" in trap) else 1
-            listed = 0 if trap in orders[n] else 1
-            return trap, (marked, band, easy, listed,
+            # A hyphen or apostrophe trap ranks ahead of a plain one in pro.
+            # Traps inside the same band are equally deadly this game, and the
+            # style picks among them: favoured endings, then the least played,
+            # then this game's own order. Bands are measured from the deadliest
+            # ending on offer, so it never sits alone at a band edge. Long
+            # answers make up for a few more of them, never for a crowd.
+            quality = deadliness(value, shortest, mean)
+            if plain:
+                band = math.floor(quality / style.width)
+            else:
+                best, fewest = floor.get(n, (quality, crowd(value)))
+                band = math.floor(max(0.0, quality - best, crowd(value) - fewest) / style.width)
+            marked = 0 if (not self.casual and ("-" in trap or "'" in trap)) else 1
+            listed = (0 if trap in orders[n] else 1) if plain else 0
+            # The plain order puts the fewest casual groups first outright; a
+            # style weighs them inside the deadliness like pro's answers.
+            group_key = groups if self.casual and plain else 0
+            return trap, (marked, group_key, band, easy, 0 if style.favours(trap) else 1, listed,
+                          self._recent_traps.get(trap, 0) if not plain else 0,
                           0.0 if plain else style.hash(trap), trap)
 
         def word_key(word: str, cheap: bool):
@@ -1177,7 +1320,7 @@ class MatchSession:
             nonlocal cancel
             exact_trap, exact_value = ending(word, exact)
             hedge_trap, hedge_value = ending(word, hedge)
-            tie = 0.0 if plain else style.hash(word)
+            tie = 0.0 if plain else self._recent_words.get(word, 0) + style.hash(word)
             if exact_trap:
                 traps[word] = exact_trap
                 return (0, exact_value, hedge_value or worst, word_key(word, False), tie, word)
@@ -1196,6 +1339,12 @@ class MatchSession:
         # A banned hand-over is avoided while anything else fits, never at the
         # cost of the turn: "tg" is only answered by "tgif".
         candidates = [w for w in fitting if not self._hands_blacklisted(w, exact)] or fitting
+        if exact:
+            # Handing an unused word means the opponent just presses Enter.
+            safe = [w for w in candidates
+                    if w[-exact:] in blocked or not engine._is_known_word(w[-exact:])]
+            if safe:
+                candidates = safe
         # Rate each distinct ending once. Trap endings always outrank the rest,
         # so when enough words end in one, the tens of thousands of others
         # behind a one-letter prompt can't reach the top and are never scored.
@@ -1203,6 +1352,11 @@ class MatchSession:
         for n in (exact, hedge):
             if n:
                 good[n] = {t for t in {w[-n:] for w in candidates if len(w) > n} if trap_stats(t)}
+                if good[n]:
+                    infos = [trap_stats(t) for t in good[n]]
+                    fewest = min(crowd(info[1]) for info in infos)
+                    floor[n] = (min(deadliness(info[1], info[3], info[4]) for info in infos
+                                    if crowd(info[1]) - fewest < style.width), fewest)
         trapped = [w for w in candidates
                    if any(n and len(w) > n and w[-n:] in good[n] for n in (exact, hedge))]
         strong = [(key, w) for key, w in ((score(w, False), w) for w in trapped) if key[0] < 2]
@@ -1321,6 +1475,24 @@ class MatchSession:
                 if len(w) > len(prefix) and w not in engine.used_words and w not in skip]
         return min(pool, key=lambda w: (len(w), w)) if pool else ""
 
+    def finish_in_time(self, prefix: str, current: str, seconds: float) -> Tuple[str, float]:
+        """Least remaining editing work, counting letters already on screen."""
+        pool = self.engine.prefix_candidates(prefix)
+        if self._can_self_solve(prefix):
+            pool = [*pool, prefix]
+        candidates = []
+        for word in pool:
+            if word == self._their_word():
+                continue
+            deletes, inserts = edit_cost(current, word)
+            cost = deletes * .065 + inserts * SECONDS_PER_LETTER + .4
+            if cost <= seconds:
+                candidates.append((cost, len(word), word))
+        if not candidates:
+            return "", float("inf")
+        cost, _, word = min(candidates)
+        return word, cost
+
     def note_given(self, prompt: str) -> None:
         """The opponent's actual starting prompt after our last word."""
         prompt = (prompt or "").lower()
@@ -1341,6 +1513,10 @@ class MatchSession:
         if not word:
             return
         self.engine.mark_used(word)
+        self._recent_words[word] = self._recent_words.get(word, 0) + 1
+        if prefix and len(word) > len(prefix):
+            ending = word[-len(prefix):]
+            self._recent_traps[ending] = self._recent_traps.get(ending, 0) + 1
         # Until the opponent's prompt is seen, assume it is as long as ours.
         prefix = prefix or self.last_prefix
         n = len(prefix) if prefix and word.startswith(prefix) else 0

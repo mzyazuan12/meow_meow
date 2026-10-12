@@ -11,7 +11,8 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 import threading
 import time
 import tkinter as tk
-from collections import Counter
+from bisect import bisect_left
+from collections import Counter, deque
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -46,6 +47,7 @@ HELPER = Path.home() / ".last-letter-helper"
 MODE_PATH = HELPER / "autotype_mode.txt"
 SPAM_PATH = HELPER / "autotype_spam.txt"
 SPAM_BASE_PATH = HELPER / "autotype_spam_base.txt"
+PERFORMANCE_PATH = HELPER / "autotype_performance.txt"
 
 INK = "#0b0b0a"
 BONE = "#f1efe7"
@@ -64,6 +66,18 @@ ENTER_GAP = 0.10
 ENTER_RETRY_AFTER = 0.9
 REFUSED_AFTER = 0.8
 MAX_ALTERNATIVES = 3
+# Deletion must make visible progress. A locked prompt or delayed screen must
+# never keep the controller in an endless Backspace worker loop.
+MAX_CLEAR_PASSES = 3
+# How long a key takes to show on the board, learned from our own keys. A row
+# missing its last letters inside this delay is still drawing, not mistyped.
+ECHO_DEFAULT = 0.15
+ECHO_MIN = 0.05
+ECHO_MAX = 0.6
+# With this little of the turn left, Enter goes without checking the board.
+ENTER_NOW = 0.3
+# A confirmed prompt on our turn that nothing acts on for this long is typed.
+TURN_STALL = 0.9
 
 
 PANEL_BIN = _ROOT / "autotype" / "llpanel"
@@ -170,8 +184,24 @@ class AutotypeApp:
         self._keys_sent = ""
         self._keys_now = ""
         self._reprompt_hits = ("", 0)
+        self._reprompt_read_at = 0.0
         self._resort_tried: set[str] = set()
         self._unrecovered = None
+        # (sent at, letters typed after it) for every key of the current word.
+        self._key_log: deque = deque(maxlen=128)
+        self._echo_samples: deque = deque(maxlen=12)
+        self._echo_text: str | None = None
+        self._echo_after = 0.0
+        self._stall_since = 0.0
+        self._stall_reads: deque = deque()
+        self._typing_plan = None
+        self._plan_index = 0
+        self._last_timer_edit = 0.0
+        self._orphan_since = None
+        self._bubble_hits = {}
+        self._bubble_baseline = set()
+        self._bubble_turn = ""
+        self._high_performance = self._load_text(PERFORMANCE_PATH, "off") == "on"
         mode = self._load_text(MODE_PATH, "casual").lower()
         if mode not in ("casual", "pro", "spam"):
             mode = "casual"
@@ -191,6 +221,7 @@ class AutotypeApp:
             if self._spam:
                 self.face.send("SPAMTEXT", self._spam)
             self.face.send("ARMED", "0")
+            self._paint_performance()
         else:
             self._build()
             self._paint_mode()
@@ -217,7 +248,7 @@ class AutotypeApp:
 
     def _build(self) -> None:
         win = self.root
-        win.title("eschaton v4.8")
+        win.title("eschaton v4.9")
         win.geometry(self._place())
         try:
             win.attributes("-topmost", True)
@@ -231,7 +262,7 @@ class AutotypeApp:
 
         top = tk.Frame(root, bg=INK)
         top.pack(fill="x", padx=16, pady=(14, 0))
-        tk.Label(top, text="eschaton v4.8", bg=INK, fg=BONE, font=("Helvetica", 20, "bold")).pack(side="left")
+        tk.Label(top, text="eschaton v4.9", bg=INK, fg=BONE, font=("Helvetica", 20, "bold")).pack(side="left")
         self.used_var = tk.StringVar(value="USED 0")
         tk.Label(top, textvariable=self.used_var, bg=INK, fg=MUTED, font=(mono, 11)).pack(side="right")
 
@@ -341,6 +372,10 @@ class AutotypeApp:
         tk.Label(foot, textvariable=self.trap_var, bg=CARD, fg=MUTED, font=(mono, 14)).grid(
             row=1, column=1, sticky="w", padx=(16, 0)
         )
+        self.performance_btn = tk.Button(card, command=self._toggle_performance, relief="flat",
+                                         font=(mono, 11), padx=6, pady=6)
+        self.performance_btn.pack(fill="x", padx=14, pady=(0, 10))
+        self._paint_performance()
 
         actions = tk.Frame(root, bg=INK)
         actions.pack(fill="x", padx=16)
@@ -419,7 +454,7 @@ class AutotypeApp:
         while not self._stop.is_set():
             try:
                 run_capture(self._stop, self._enqueue_frame, self._enqueue_roblox,
-                            lambda: self._name, self._paused.is_set)
+                            lambda: self._name, self._paused.is_set, lambda: self._high_performance)
             except Exception as exc:
                 self._emit("LOG", f"Capture restarted: {exc}")
             if self._stop.wait(0.5):
@@ -441,6 +476,18 @@ class AutotypeApp:
                 counts[sig] = counts.get(sig, 0) + 1
             redundant = next((index for index, frame in frames
                               if counts[signature(frame)] > 2), None)
+            if redundant is None:
+                # Preserve the starting prompt and final opponent word when
+                # catching up. Intermediate growing reads carry less evidence.
+                for position in range(1, len(frames) - 1):
+                    index, frame = frames[position]
+                    before, after = frames[position - 1][1], frames[position + 1][1]
+                    board, later = frame.get("prompt", ""), after.get("prompt", "")
+                    if (before.get("header") == frame.get("header") == after.get("header")
+                            and after.get("full") and board and len(later) > len(board)
+                            and later.startswith(board)):
+                        redundant = index
+                        break
             victim = frames[0][0] if redundant is None else redundant
             del pending[victim]
             self._queue.unfinished_tasks -= 1
@@ -448,6 +495,9 @@ class AutotypeApp:
             return True
 
     def _enqueue_frame(self, frame: dict) -> None:
+        if self._high_performance:
+            while self._queue.qsize() >= 8 and self._drop_queued_frame():
+                pass
         self._put_event("FRAME", frame)
 
     def _enqueue_roblox(self, status: str) -> None:
@@ -474,7 +524,7 @@ class AutotypeApp:
         elif kind == "SUBMIT":
             gen, word, input_length = payload[:3]
             if gen == self._gen and not self._paused.is_set() and not self._type_cancel.is_set():
-                self._submit(word, input_length)
+                self._submit(word, input_length, payload[3] if len(payload) > 3 else 0.0)
         elif kind == "TYPE_DONE":
             gen, sent, input_length, message = payload
             # Old workers must never release a newer turn or correction.
@@ -504,7 +554,10 @@ class AutotypeApp:
             gen, prompt, success = payload
             if gen == self._gen and self._clear:
                 # Sending Backspace is not proof that Roblox deleted anything.
-                self._clear.update(after=time.monotonic(), read_at=0.0, hits=0, board="", working=False)
+                self._clear.update(after=time.monotonic(), read_at=0.0, hits=0, board="", working=False,
+                                   success=success)
+                if success:
+                    self._clear["passes"] = self._clear.get("passes", 0) + 1
                 if not success:
                     self._note("Deletion interrupted. It will resume on your turn.")
 
@@ -619,7 +672,8 @@ class AutotypeApp:
                 )
                 self.session.set_mode(self._mode)
                 self.session.set_spam_suffixes(self._spam)
-                self.session.new_game()
+                if self.session.style is None:
+                    self.session.roll_style()
             self._emit("LOADED", count)
         except Exception as exc:
             self._emit("STATUS", "DICTIONARY FAILED")
@@ -713,17 +767,22 @@ class AutotypeApp:
                              else f"READ {frame.get('ms', 0)}ms  ·  {self._count:,} WORDS")
         header = frame.get("header", "")
         speaker = speaker_from_header(header, self._name)
-        full = bool(frame.get("full", True))
         board = frame.get("prompt", "")
+        full = (bool(frame.get("full", True)) and frame.get("row_complete", True)
+                and "?" not in board and int(frame.get("tiles") or len(board)) == len(board))
+        if not full:
+            frame = dict(frame, full=False)
         whose = ""
         if header_is_turn(header) and speaker:
             ours = header_is_ours(self._name, header) or any(names_match(alias, speaker) for alias in self._aliases)
             whose = "ours" if ours else "theirs"
         elif (not speaker and self._current_turn == "ours" and board
+              and not (self.watch._await_opponent and not self._typed_word)
               and (not header or header_is_turn(header) or self.typing or self._clear
                    or self._typed_word)):
             # An unread name does not revoke a turn already identified. Board
-            # acceptance and a readable different speaker still end that turn.
+            # acceptance and a readable different speaker still end that turn;
+            # after acceptance an unreadable name is the opponent's.
             whose = "ours"
         if self._manual_turn:
             mismatch = speaker and self._name and not (names_match(self._name, speaker)
@@ -742,7 +801,6 @@ class AutotypeApp:
                         self.name_var.set(speaker)
         # A mirrored prompt is only flipped when it disagrees with the ending
         # of the word the opponent actually typed.
-        self.session.opponent_word = self.watch.opponent_word
         # Normalize a reversed prefix throughout typing AND deletion recovery.
         # Preserve opponent readings as seen; our previous prefix is no longer
         # authority to rewrite another player's answer.
@@ -750,6 +808,13 @@ class AutotypeApp:
         active_input = (self.typing or self._typed_word or self._clear
                         or self._needs_clear or self._resume_clear)
         raw = board
+        if self._high_performance and not self._typed_word:
+            self._observe_bubbles(frame, whose, raw, now)
+        if whose == "ours" and not active_input and full and len(raw) > 4 and self.watch._opponent_active:
+            # The header can change before their final word disappears. Keep
+            # this raw reading before consulting the previous frame's context.
+            self.watch._remember(raw)
+        self.session.opponent_word = self.watch.opponent_word
         if whose == "theirs" and (self._theirs_streak >= 2 or not active_input and self._theirs_streak):
             self._view = None
         seen = self._seen_as(board) if whose != "theirs" else board
@@ -758,7 +823,8 @@ class AutotypeApp:
             frame = dict(frame, prompt=board, tiles=len(board)
                          if int(frame.get("tiles") or 0) == len(raw) else frame.get("tiles"))
         else:
-            fixed = self._unglitch(board) if self.ready and full and not active_input else ""
+            fixed = (self._unglitch(board)
+                     if self.ready and full and not active_input and whose == "ours" else "")
             if fixed:
                 board = fixed
                 frame = dict(frame, prompt=board, tiles=len(board))
@@ -798,6 +864,20 @@ class AutotypeApp:
         self._show_turn(whose, header)
         if not self.ready:
             return
+        if self.typing and whose != "theirs":
+            self._note_echo(frame)
+        if (whose == "ours" and not self.typing and not self._typed_word and not self.watch.typed
+                and not self._needs_clear and not self._clear and self.watch.played
+                and (self._typing_thread is None or not self._typing_thread.is_alive())):
+            # A stopped/failed worker must not leave a permanent played latch
+            # behind an otherwise idle YOUR TURN panel.
+            if self._orphan_since is None:
+                self._orphan_since = now
+            elif now - self._orphan_since >= .15:
+                self.watch.played = ""
+                self._orphan_since = None
+        else:
+            self._orphan_since = None
         if self._clear:
             self._check_clear(frame, whose, now)
             return
@@ -834,7 +914,7 @@ class AutotypeApp:
             self._clear_choices()
         # Ranking a one-letter prompt is slow; doing it for every short read
         # of the opponent's word backs up frames right before our turn.
-        if (full and prefix and prefix != self._shown and whose != "theirs"
+        if (full and prefix and prefix != self._shown and not whose
                 and not self.typing and not self.watch.typed):
             self._shown = prefix
             self._retried = ""
@@ -849,7 +929,8 @@ class AutotypeApp:
                 self._cancel_typing(release=True)
                 self._note("Turn changed. Typing stopped.")
             elif whose == "ours":
-                self._watch_own_keys(raw, frame)
+                if not self._watch_own_keys(raw, frame):
+                    self._check_deadline(frame, now)
             return
         if self._typed_word:
             if frame.get("captured_at", now) <= self._submitted_at:
@@ -883,6 +964,8 @@ class AutotypeApp:
             self.watch.forget_partials()
             self._unrecovered = None if kept or not partials else (partials, event.get("given", ""))
             if kept:
+                self.watch.confirm_opponent(kept)
+                self.session.opponent_word = kept
                 self._refresh_used()
                 self._note(f"THEIRS  {kept}")
             elif partials:
@@ -900,8 +983,18 @@ class AutotypeApp:
             else:
                 return
         if not prompt:
+            if whose == "ours" and not self._shown and not self.typing:
+                self._set_status("CONFIRMING FULL PROMPT" if full else "READING PROMPT TILES")
             self._resume_aborted(board, whose)
-            return
+            prompt = self._turn_stalled(board, whose, full, now)
+            if not prompt:
+                return
+            # Whatever held it back, a prompt left on our turn loses the game.
+            self._note(f"PROMPT {prompt} was left unanswered; typing it now.")
+            self._stall_since = 0.0
+            self._stall_reads.clear()
+            self.watch.rearm(prompt, now)
+            self._shown = ""
         if prompt != self._shown:
             self._retried = ""
             self._shown = prompt
@@ -948,14 +1041,16 @@ class AutotypeApp:
             return ""
         # Worked out once per reading: their word is marked used as soon as
         # our prompt confirms, and must still count.
-        if self._glitch_key != context[:2]:
-            self._glitch_key, self._glitch_fixes = context[:2], {}
+        key = (context[0], context[1], tuple(context[2]), max(self.watch.floor, len(context[1])))
+        if self._glitch_key != key:
+            self._glitch_key, self._glitch_fixes = key, {}
         if board not in self._glitch_fixes:
             with self._lock:
                 fixed = self.session.descramble_prompt(board, *context, floor=self.watch.floor)
             self._glitch_fixes[board] = fixed
             if fixed:
-                self._note(f"GLITCHED PROMPT  {board} → {fixed}")
+                kind = "MIRRORED PROMPT" if board == fixed[::-1] else "GLITCHED PROMPT"
+                self._note(f"{kind}  {board} → {fixed}")
         return self._glitch_fixes[board]
 
     def _watch_own_keys(self, raw: str, frame: dict) -> bool:
@@ -974,6 +1069,21 @@ class AutotypeApp:
             return False
         view = self._view
         shown = view["shown"] if view else prompt
+        captured = frame.get("captured_at", 0)
+        if captured and captured <= self._reprompt_read_at:
+            return False
+        self._reprompt_read_at = captured
+        # The worker can already be several keys ahead of this capture. Any
+        # row explained by a state we actually sent is our input, not a new
+        # prompt to erase and restart for.
+        history = list(self._key_log)
+        for sent_at, text in history:
+            if captured and sent_at > captured:
+                continue
+            if raw == shown + text or (view and view["mirrored"] is True
+                                       and raw == text[::-1] + shown):
+                self._reprompt_hits = ("", 0)
+                return False
         body = raw[:len(raw) - len(typed)] if raw.endswith(typed) else ""
         rest = raw[len(typed):] if raw.startswith(typed[::-1]) else ""
         # Mirrored, a doubled first key lands between our letters and the prompt.
@@ -1021,6 +1131,10 @@ class AutotypeApp:
             self._view = {"shown": found[::-1], "real": found, "mirrored": True}
             self._note(f"MIRRORED ROW  {raw[len(typed):]} → {found}")
         else:
+            if view is not None:
+                # Once our letters are erased the row shows the shuffle again
+                # ("xno"); it must not be read as the old prompt ("n") twice.
+                view["real"] = found
             self._note(f"PROMPT IS {found}  (read {prompt} before it finished)")
         self._restart_for(found, found + typed)
         return True
@@ -1034,6 +1148,8 @@ class AutotypeApp:
         with self._lock:
             kept = self.session.recover_partial(partials, ending, given)
         if kept:
+            self.watch.confirm_opponent(kept)
+            self.session.opponent_word = kept
             self._refresh_used()
             self._note(f"THEIRS  {kept}")
 
@@ -1162,7 +1278,8 @@ class AutotypeApp:
         self._aborted_prompt = ""
         self._type_cancel = threading.Event()
         self._input_length = 0
-        plan = turn_plan(suffix, prompt, self._budget(left), is_word=self.engine._is_known_word)
+        plan = turn_plan(suffix, prompt, self._budget(left), is_word=self.engine._is_known_word,
+                         immediate=True)
         self._launch_typing(prompt, word, plan)
 
     def _budget(self, left: float | None) -> float | None:
@@ -1179,7 +1296,15 @@ class AutotypeApp:
             self._keys_sent = ""
         self._keys_sent += start
         self._keys_now = start
+        self._typing_plan = plan
+        self._plan_index = 0
+        self._key_log.clear()
+        self._echo_text = None
+        self._echo_after = 0.0
+        self._stall_since = 0.0
+        self._stall_reads.clear()
         self._reprompt_hits = ("", 0)
+        self._reprompt_read_at = 0.0
         self.watch.played = prompt
         self._typed_suffix = word[len(prompt):]
         self.typing = True
@@ -1238,6 +1363,36 @@ class AutotypeApp:
             return
         self.watch.played = ""
         self._start_typing(ready)
+
+    def _turn_stalled(self, board: str, whose: str, full: bool, now: float) -> str:
+        """The prompt on our turn once nothing has acted on it for TURN_STALL seconds.
+
+        Reads are tallied rather than required to repeat, so a letter the
+        reader keeps flickering on cannot hold the turn up either.
+        """
+        thread = self._typing_thread
+        idle = (whose == "ours" and self.armed and not self.typing
+                and not self._typed_word and not self.watch.typed and not self._erasing
+                and not self._clear and not self._needs_clear and not self._resume_clear
+                and not self._paused.is_set() and not self._input_problem
+                and (thread is None or not thread.is_alive()))
+        if not idle:
+            self._stall_since = 0.0
+            self._stall_reads.clear()
+            return ""
+        self._stall_since = self._stall_since or now
+        prefix = self.watch._prompt(board) if full else ""
+        if prefix:
+            self._stall_reads.append((now, prefix))
+        while self._stall_reads and now - self._stall_reads[0][0] > TURN_STALL:
+            self._stall_reads.popleft()
+        # Right after our Enter the header can still name us over our own
+        # ending, which is the opponent's prompt. It never lags this long.
+        hold = TURN_STALL * (2 if self.watch._await_opponent else 1)
+        if not prefix or now - self._stall_since < hold or len(self._stall_reads) < 3:
+            return ""
+        best, count = Counter(read for _at, read in self._stall_reads).most_common(1)[0]
+        return prefix if best == prefix and count * 2 >= len(self._stall_reads) else ""
 
     def _cancel_typing(self, *, release: bool = False) -> None:
         self._type_cancel.set()
@@ -1314,10 +1469,11 @@ class AutotypeApp:
         gen = self._gen
         cancel = self._type_cancel
         board = self._last_frame.get("prompt", "")
-        visible = len(board) - len(prompt) if board.startswith(prompt) else 0
-        input_length = max(self._input_length, visible, len(self._typed_suffix))
+        visible = self._read_board(self._last_frame, prompt)
+        input_length = len(visible) - len(prompt) if visible is not None else self._input_length
         self._clear = {"gen": gen, "prompt": prompt, "word": word, "after": time.monotonic(),
-                       "read_at": 0.0, "board": "", "hits": 0, "working": True}
+                       "read_at": 0.0, "board": "", "hits": 0, "working": True,
+                       "passes": 0, "last_board": board, "unchanged": 0}
         self._erase_suffix(gen, prompt, input_length, cancel)
 
     def _erase_suffix(self, gen: int, prompt: str, input_length: int, cancel: threading.Event) -> None:
@@ -1353,20 +1509,25 @@ class AutotypeApp:
         if whose != "ours" or state["working"] or not self.armed:
             return
         captured = frame.get("captured_at", now)
-        if captured <= state["after"] or captured <= state["read_at"]:
+        echo = self._echo_delay() if state.get("passes", 0) else 0.0
+        if captured <= state["after"] + echo or captured <= state["read_at"]:
             return
         state["read_at"] = captured
         board = frame.get("prompt", "")
+        prompt = state["prompt"]
         full = (bool(frame.get("full", True)) and frame.get("row_complete", True)
                 and "?" not in board)
         if not full or int(frame.get("tiles", len(board))) != len(board):
             state["hits"] = 0
-            return
+            if now - state["after"] < 1.0:
+                return
+            # The Backspaces went out and the row never read again. Carry on
+            # from the prompt rather than sit out the turn.
+            board, state["board"], state["hits"] = prompt, prompt, 1
         state["hits"] = state["hits"] + 1 if board == state["board"] else 1
         state["board"] = board
         if state["hits"] < 2:
             return
-        prompt = state["prompt"]
         # An emptied input can bring back a shuffled board ("rmarn" for "ram").
         fixed = "" if board.startswith(prompt) else self._unglitch(board)
         if (not board.startswith(prompt) and len(fixed) < len(prompt)
@@ -1392,10 +1553,20 @@ class AutotypeApp:
                 self._present(prompt)
                 self._start_typing(prompt)
             return
-        if board.startswith(prompt) and now - state["after"] >= 0.10:
+        if board.startswith(prompt) and now - state["after"] >= max(0.10, self._echo_delay()):
+            # Two successful batches with no change can mean the remaining
+            # tiles are a longer, immutable prompt. Long rows are resumed as
+            # input instead; neither case needs another full erase.
+            unchanged = state.get("unchanged", 0)
+            if state.get("success", True):
+                unchanged = unchanged + 1 if board == state.get("last_board") else 0
+            state["unchanged"] = unchanged
+            if state.get("retry_only") or unchanged >= 2 or state.get("passes", 0) >= MAX_CLEAR_PASSES:
+                self._continue_clear(state, board, now)
+                return
             # A dropped Backspace left characters behind. Delete only the
             # remaining suffix, then confirm the prefix again before retyping.
-            state.update(working=True, hits=0, after=now)
+            state.update(working=True, hits=0, after=now, last_board=board)
             self._erase_suffix(self._gen, prompt, len(board) - len(prompt), self._type_cancel)
         elif self.watch._prompt(seen) and now - state["after"] >= 0.25:
             # The game advanced while deletion was pending. Release the old
@@ -1413,6 +1584,63 @@ class AutotypeApp:
             self._present(board)
             self._start_typing(board)
 
+    def _continue_clear(self, state: dict, board: str, now: float) -> None:
+        """Release a deletion that stopped progressing and use the visible row."""
+        thread = self._typing_thread
+        if thread is not None and thread.is_alive():
+            return
+        prompt = state["prompt"]
+        fresh_prompt = self.watch._prompt(board)
+        if fresh_prompt and state.get("unchanged", 0) >= 2:
+            self._cancel_typing()
+            self._needs_clear = False
+            self._typed_word = self.watch.typed = ""
+            self._typed_suffix = self._keys_now = self._keys_sent = ""
+            self._input_length = 0
+            self._aborted_prompt = ""
+            self._view = None
+            self._alternatives = 0
+            self._retried = ""
+            with self._lock:
+                prompt = self.session.resolve_prefix(fresh_prompt)
+            self._note(f"PROMPT IS {prompt}; deletion left these tiles unchanged.")
+            self.watch.rearm(prompt, now)
+            self._shown = prompt
+            self._present(prompt)
+            self._start_typing(prompt)
+            return
+        left = self._time_left()
+        with self._lock:
+            word = state["word"]
+            if (not word or not word.startswith(prompt) or word in self.engine.used_words
+                    or word in self.engine.rejected_words):
+                # If the visible word is already usable, Enter needs no edits.
+                if (self.engine._is_known_word(board) and board not in self.engine.used_words
+                        and board not in self.engine.rejected_words):
+                    word = board
+                else:
+                    word, _deletes, _letters = self.session.alternative(prompt, board, left, resolve=False)
+            if not word:
+                word = self.session.last_resort(prompt, self._resort_tried)
+                if word:
+                    self._resort_tried.add(word)
+        if not word:
+            # Keep checking for a new row or an available answer, without
+            # sending more deletions against the same unresponsive input.
+            state.update(retry_only=True, after=now, hits=0)
+            self._note(f"No available word for {prompt}; checking again.")
+            return
+        start = board[len(prompt):]
+        self._cancel_typing()
+        self._needs_clear = False
+        self._input_length = len(start)
+        self._typed_word = self.watch.typed = ""
+        self._aborted_prompt = ""
+        self._retried = ""
+        self.watch.rearm(prompt, now)
+        self._note(f"Deletion didn't change the row; continuing with {word}.")
+        self._launch_typing(prompt, word, edit_plan(start, word[len(prompt):], self._budget(left)), start=start)
+
     def _read_board(self, frame: dict, prompt: str) -> str | None:
         board = frame.get("prompt") or ""
         if not frame.get("full") or not frame.get("row_complete", True):
@@ -1423,127 +1651,163 @@ class AutotypeApp:
             return None
         return board
 
-    def _needs_repair(self, board: str, word: str, prompt: str) -> bool:
-        """A complete row that is not the word: short, mistyped or with extra keys.
+    def _echo_delay(self) -> float:
+        """How long our keys have recently taken to show on the board."""
+        samples = list(self._echo_samples)[-8:]
+        if not samples:
+            return ECHO_DEFAULT
+        return min(ECHO_MAX, max(ECHO_MIN, max(samples)))
 
-        A longer row can still be the word from before a backspace has drawn,
-        so the caller only acts on it once fresh captures keep showing it.
+    def _note_echo(self, frame: dict) -> None:
+        """Time each new state of our row against the key that produced it."""
+        prompt = self._typing_prompt
+        board = self._read_board(frame, prompt) if prompt else None
+        if board is None or board == self._echo_text:
+            return
+        first, self._echo_text = self._echo_text is None, board
+        if first:
+            return
+        typed = board[len(prompt):]
+        captured = frame.get("captured_at") or 0
+        # Only keys newer than the last one seen count: a tile that blinks out
+        # while drawing brings back an older row, not a slower key.
+        for sent_at, text in reversed(list(self._key_log)):
+            if sent_at <= self._echo_after:
+                break
+            if sent_at <= captured and text == typed:
+                self._echo_samples.append(min(ECHO_MAX * 2, captured - sent_at))
+                self._echo_after = sent_at
+                break
+
+    def _row_fix(self, board: str | None, word: str, prompt: str, steady: float,
+                 captures: int, echo: float) -> bool:
+        """Whether a settled row that is not the word should be edited.
+
+        Missing last letters are usually still drawing, so they are retyped
+        only once the row has kept them missing past the echo delay. A row
+        with most of the word unread is not evidence of anything.
         """
-        if board == word or not board.startswith(prompt):
+        if board is None or board == word:
             return False
-        suffix = word[len(prompt):]
-        visible = board[len(prompt):]
-        if not suffix:
-            return False
+        target, visible = word[len(prompt):], board[len(prompt):]
         if len(board) > len(word):
-            # Extra keys (a doubled letter, a Backspace that never landed).
-            return len(board) - len(word) <= 3
-        # One or two letters short, at the end (not drawn yet) or anywhere
-        # (a key that never landed), or the same length with a wrong letter.
-        return len(visible) >= len(suffix) - 2
-
-    def _settled_board(self, cancel: threading.Event, after: float, prompt: str,
-                       newer_than: float = 0.0) -> tuple[str | None, float]:
-        """The row as read after the last key has had time to appear.
-
-        Returns the board and when it was captured. ``newer_than`` insists on a
-        capture taken after one already used, so a repair is checked on the
-        screen again rather than against the same frame.
-        """
-        frame = dict(self._last_frame or {})
-        if (frame.get("captured_at") or 0) <= 0 or after <= 0:
-            return None, 0.0
-        deadline = time.monotonic() + 0.22
-        while True:
-            frame = dict(self._last_frame or {})
-            captured = frame.get("captured_at") or 0
-            if captured >= after + 0.08 and captured > newer_than:
-                board = self._read_board(frame, prompt)
-                # A tile mid-draw clears on the next capture; a row too long
-                # for the capture never does.
-                if board is not None or frame.get("row_clipped") or time.monotonic() >= deadline:
-                    return board, captured
-                newer_than = captured
-            if time.monotonic() >= deadline:
-                return None, 0.0
-            if not newer_than and (captured <= 0 or time.monotonic() - captured > 0.45):
-                return None, 0.0
-            if cancel.wait(0.02):
-                return None, 0.0
-
-    def _extra_keys_confirmed(self, cancel: threading.Event, board: str, prompt: str,
-                              seen_at: float) -> bool:
-        """Whether fresh captures keep showing the same row with extra letters."""
-        deadline = time.monotonic() + 0.35
-        hits = 1
-        while time.monotonic() < deadline:
-            frame = dict(self._last_frame or {})
-            captured = frame.get("captured_at") or 0
-            if captured > seen_at:
-                read = self._read_board(frame, prompt)
-                if read is not None:
-                    if read != board:
-                        return False
-                    seen_at = captured
-                    hits += 1
-                    if hits >= 3:
-                        return True
-                else:
-                    seen_at = captured
-            if cancel.wait(0.02):
-                return False
-        return False
+            # A doubled key or a Backspace that never landed. Two captures
+            # taken after the keys had time to show agree it is there.
+            return captures >= 2 and len(board) - len(word) <= 3
+        if len(visible) < len(target) - 2:
+            return False
+        if word.startswith(board):
+            return steady >= max(0.1, echo)
+        return steady >= 0.05
 
     def _repair_from_screen(self, gen: int, word: str, shown: str, after: float,
                             cancel: threading.Event) -> str | None:
         """Make the row exactly the word before Enter. None means the turn ended.
 
-        The screen is read again after each fix, so a doubled letter, a missed
-        Backspace or a dropped key never reaches Enter.
+        Enter goes on the first capture, taken once the keys had time to show,
+        that reads the word. A row that stays wrong is fixed and read again.
+        One that can't be read is left to the keys that were sent, and with
+        the turn nearly over Enter goes regardless: waiting can only lose it.
         """
         prompt = self._typing_prompt or ""
         if not prompt or not word.startswith(prompt) or len(word) == len(prompt):
             return shown
-        used_at = 0.0
-        for _attempt in range(3):
-            board, captured = self._settled_board(cancel, after, prompt, used_at)
+        target = word[len(prompt):]
+        fixes = 0
+        seen, seen_at, captures, newer_than = None, 0.0, 0, 0.0
+        while True:
             if cancel.is_set() or gen != self._gen or self._stop.is_set():
                 return None
-            if board == word:
-                return word[len(prompt):]
-            if not board or not self._needs_repair(board, word, prompt):
+            now = time.monotonic()
+            echo = self._echo_delay()
+            left = self._time_left()
+            if left is not None and left <= ENTER_NOW:
                 return shown
-            if cancel.wait(0.07) or gen != self._gen or self._stop.is_set():
+            frame = self._last_frame or {}
+            captured = frame.get("captured_at") or 0
+            if captured <= 0 or now - captured > 0.5 or now - after > max(0.6, 3 * echo + 0.2):
+                # No live picture to check against, or a row that never settles.
+                return shown
+            if captured > newer_than and captured >= after + echo:
+                newer_than = captured
+                board = self._read_board(frame, prompt)
+                if board == word:
+                    return target
+                if board is None and (frame.get("row_clipped") or now - after >= echo + 0.2):
+                    # Too long for the capture, or still unreadable once drawn.
+                    return shown
+                if not captures or board != seen:
+                    seen, seen_at, captures = board, now, 0
+                captures += 1
+            if captures and self._row_fix(seen, word, prompt, now - seen_at, captures, echo):
+                board = seen
+                if len(board) <= len(word):
+                    # One last look: a late capture showing the word wins.
+                    if cancel.wait(0.07) or gen != self._gen or self._stop.is_set():
+                        return None
+                    if self._read_board(dict(self._last_frame or {}), prompt) != board:
+                        seen, captures = None, 0
+                        continue
+                if fixes >= 3 or not roblox_focused():
+                    return shown
+                shown = self._finish_suffix(board[len(prompt):], target, gen=gen, cancel=cancel)
+                if shown is None:
+                    return None
+                self._emit("LOG", f"FIXED  {board} → {word}")
+                fixes += 1
+                after = time.monotonic()
+                seen, captures = None, 0
+                left = self._time_left()
+                if left is not None and left - echo - ENTER_GAP <= ENTER_NOW:
+                    # No time to read it back: the edit is the best answer.
+                    if cancel.wait(ENTER_GAP) or gen != self._gen or self._stop.is_set():
+                        return None
+                    return shown
+            if cancel.wait(0.008):
                 return None
-            if self._read_board(dict(self._last_frame or {}), prompt) != board:
-                return shown
-            if len(board) > len(word) and not self._extra_keys_confirmed(cancel, board, prompt, captured):
-                return shown
-            if cancel.is_set() or gen != self._gen or self._stop.is_set():
-                return None
-            if not roblox_focused():
-                return shown
-            shown = self._finish_suffix(board[len(prompt):], word[len(prompt):])
-            self._emit("LOG", f"FIXED  {board} → {word}")
-            used_at = captured
-            after = time.monotonic()
-            if cancel.wait(ENTER_GAP) or gen != self._gen or self._stop.is_set():
-                return None
-        return shown
 
-    def _finish_suffix(self, shown: str, suffix: str) -> str:
+    def _finish_suffix(self, shown: str, suffix: str, *, gen: int | None = None,
+                       cancel: threading.Event | None = None) -> str | None:
         """Type whatever is still missing so Enter submits the whole word."""
+        gen = self._gen if gen is None else gen
+        cancel = self._type_cancel if cancel is None else cancel
+
+        def stopped() -> bool:
+            return (gen != self._gen or cancel.is_set() or self._stop.is_set()
+                    or self._paused.is_set() or not roblox_focused())
+
         common = 0
         for left, right in zip(shown, suffix):
             if left != right:
                 break
             common += 1
         pending = suffix[common:]
+        text = shown
+        if stopped():
+            return None
         for _ in range(len(shown) - common):
+            if stopped():
+                return None
+            sent_at = time.monotonic()
             tap_key("back", "\b", 0.030)
+            if stopped():
+                return None
+            text = text[:-1]
+            self._key_log.append((sent_at, text))
+            self._keys_now = text
+            self._input_length = len(text)
         for index, ch in enumerate(pending):
+            if stopped():
+                return None
+            sent_at = time.monotonic()
             tap_key("type", ch, LAST_LETTER_HOLD if index + 1 == len(pending) else 0.030)
-        self._keys_sent += pending
+            if stopped():
+                return None
+            text += ch
+            self._key_log.append((sent_at, text))
+            self._keys_sent += ch
+            self._keys_now = text
+            self._input_length = len(text)
         self._keys_now = suffix
         return suffix
 
@@ -1569,6 +1833,7 @@ class AutotypeApp:
             last_key_at = 0.0
             steps = plan.steps
             for index, step in enumerate(steps):
+                self._plan_index = index
                 pause = step.delay - previous_hold
                 if step.kind == "enter":
                     # The last letter has to be up before Enter, or it never lands.
@@ -1580,7 +1845,9 @@ class AutotypeApp:
                     return
                 if step.kind == "enter":
                     if plan.word and shown != plan.word:
-                        shown = self._finish_suffix(shown, plan.word)
+                        shown = self._finish_suffix(shown, plan.word, gen=gen, cancel=cancel)
+                        if shown is None:
+                            return
                         last_key_at = time.monotonic()
                         input_length = len(shown)
                         if gen == self._gen:
@@ -1596,7 +1863,7 @@ class AutotypeApp:
                         self._input_length = input_length
                     # The controller presses the final Enter at once, after
                     # registering the answer, so a fast turn change counts.
-                    self._emit("SUBMIT", (gen, word, input_length, time.monotonic()))
+                    self._emit("SUBMIT", (gen, word, input_length, last_key_at))
                     sent = True
                     return
                 if step.kind == "early":
@@ -1609,6 +1876,7 @@ class AutotypeApp:
                 if (step.kind == "type" and index + 1 < len(steps)
                         and steps[index + 1].kind == "enter"):
                     hold = LAST_LETTER_HOLD
+                sent_at = time.monotonic()
                 tap_key(step.kind, step.key, hold)
                 previous_hold = hold
                 last_key_at = time.monotonic()
@@ -1622,6 +1890,7 @@ class AutotypeApp:
                     if step.kind == "type" and step.key:
                         self._keys_sent += step.key[0]
                     self._keys_now = shown
+                    self._key_log.append((sent_at, shown))
         except Exception as exc:
             message = f"Typing failed: {exc}"
         finally:
@@ -1635,9 +1904,10 @@ class AutotypeApp:
         press_enter()
         return True
 
-    def _submit(self, word: str, input_length: int) -> None:
+    def _submit(self, word: str, input_length: int, after: float = 0.0) -> None:
         if not self.armed:
             return
+        # The key worker has already checked the row against the screen.
         # Register the pending submission before Enter so a fast turn change
         # confirms it. Used words are recorded on acceptance.
         self._typed_word = word
@@ -1660,6 +1930,33 @@ class AutotypeApp:
         self._new_prompt_hits = 0
         self._manual_turn = False
         self._note(f"Entered {word}.")
+
+    def _check_deadline(self, frame: dict, now: float) -> None:
+        """Switch to a finishable answer, preserving the chosen key rhythm."""
+        left = self._time_left()
+        plan = self._typing_plan
+        if left is None or left <= 0 or not plan or now - self._last_timer_edit < .25:
+            return
+        remaining = sum(max(.03, s.delay) for s in plan.steps[self._plan_index:] if s.kind != "early") + .4
+        if remaining <= left:
+            return
+        # The keys sent are what the box holds. The board only overrides them
+        # once it reads completely, and a long row with tiny tiles never may.
+        current = self._typing_prompt + self._keys_now
+        board = self._read_board(frame, self._typing_prompt)
+        if board is not None and board != current and not current.startswith(board):
+            return
+        self._last_timer_edit = now
+        with self._lock:
+            target, cost = self.session.finish_in_time(self._typing_prompt, current, left)
+        if (not target or target == self._typing_prompt + plan.word or cost >= remaining
+                or cost > left):
+            return
+        prompt = self._typing_prompt
+        self._cancel_typing()
+        self._note(f"TIMER  {left:.1f}s left; finishing with {target}")
+        self._launch_typing(prompt, target, edit_plan(current[len(prompt):], target[len(prompt):],
+                                                     self._budget(left)), start=current[len(prompt):])
 
     def _commit_ours(self, word: str) -> None:
         self._typed_word = ""
@@ -1797,6 +2094,104 @@ class AutotypeApp:
         self._shown = prompt
         self._present(prompt)
         self._start_typing(prompt)
+
+    def _paint_performance(self) -> None:
+        text = "HIGH PERFORMANCE: " + ("ON" if self._high_performance else "OFF")
+        if self.face is not None:
+            self.face.send("PERFORMANCE", "1" if self._high_performance else "0")
+        else:
+            self.performance_btn.configure(text=text, bg=BONE if self._high_performance else INK,
+                                           fg=INK if self._high_performance else BONE)
+
+    def _observe_bubbles(self, frame: dict, whose: str, board: str, now: float) -> None:
+        """Corroborate the current opponent, never log arbitrary avatar text."""
+        if "word_bubbles" not in frame:
+            # Captured before the switch: no reading, not an empty one.
+            return
+        bubbles = {b.get("word", ""): b for b in frame["word_bubbles"]
+                   if b.get("confidence", 0) >= .72}
+        if whose == "theirs" and self._bubble_turn != "theirs":
+            self._bubble_baseline = set(bubbles)
+            self._bubble_hits.clear()
+        if whose:
+            self._bubble_turn = whose
+        context = self.watch.scramble_context()
+        # The game shows an accepted word over the player's head while the
+        # camera is still on them, so their box is mostly seen on their turn.
+        if not context or whose not in ("ours", "theirs"):
+            return
+        previous, given, seen = context
+        at = frame.get("captured_at", now)
+        fits = set()
+        for text in bubbles.keys() - self._bubble_baseline:
+            for word in self._bubble_words(bubbles[text]):
+                if (word == self.session.last_word
+                        or given and (not word.startswith(given) or len(word) <= len(given))):
+                    continue
+                # Their tiles spelled it, or it with letters they then deleted.
+                head = any(word.startswith(s) or s.startswith(word) for s in [previous, *seen]
+                           if len(s) >= max(3, len(given) + 1))
+                agrees = False
+                if whose == "ours":
+                    n = max(self.watch.floor, len(given), min(4, len(board)))
+                    tail = word[-n:] if n else ""
+                    agrees = board == tail or board == tail[::-1] or (tail and not Counter(tail) - Counter(board)
+                              and len(board) - len(tail) <= MAX_SCRAMBLE_EXTRA)
+                if not head and not (given and agrees):
+                    continue
+                last, hits = self._bubble_hits.get(word, (0.0, 0))
+                if at > last:
+                    hits += 1
+                    self._bubble_hits[word] = (at, hits)
+                if hits >= 2:
+                    fits.add(word)
+        if len(fits) != 1:
+            return
+        word = fits.pop()
+        if self.watch._opponent_active:
+            self.watch._remember(word)
+        else:
+            self.watch.confirm_opponent(word)
+            prompt = self._typing_prompt or self.watch._prompt(board)
+            if prompt and word.endswith(prompt) and self.session.note_opponent_word(word):
+                self._refresh_used()
+                self._note(f"THEIRS  {word}  (word bubble confirmed)")
+
+    def _bubble_words(self, bubble: dict) -> list:
+        """Dictionary words a speech box can say, the likeliest reading first.
+
+        Each place holds every letter its glyph scored about as well for. Only
+        spellings that some word starts with are followed.
+        """
+        options = bubble.get("options") or tuple((letter,) for letter in bubble.get("word", ""))
+        words = self.engine.wordlist
+        found: list = []
+
+        def grow(prefix: str, index: int) -> None:
+            if len(found) >= 8:
+                return
+            if index == len(options):
+                if prefix not in found and self.engine._is_known_word(prefix):
+                    found.append(prefix)
+                return
+            for letter in options[index]:
+                head = prefix + letter
+                at = bisect_left(words, head)
+                if not head or at < len(words) and words[at].startswith(head):
+                    grow(head, index + 1)
+
+        grow("", 0)
+        return found
+
+    def _toggle_performance(self) -> None:
+        self._high_performance = not self._high_performance
+        self._bubble_hits.clear()
+        self._bubble_baseline.clear()
+        self._bubble_turn = ""
+        self._save_text(PERFORMANCE_PATH, "on" if self._high_performance else "off")
+        self._paint_performance()
+        self._note("High performance on: every new frame is read at once, and speech boxes confirm their words."
+                   if self._high_performance else "High performance off.")
 
     def _toggle_pause(self) -> None:
         if not self._paused.is_set():
@@ -1980,6 +2375,10 @@ class AutotypeApp:
         self._selection_retry_at = 0.0
         self._new_prompt_hits = 0
         self._alternatives = 0
+        self._orphan_since = None
+        self._bubble_hits.clear()
+        self._bubble_baseline.clear()
+        self._bubble_turn = ""
         self._given_seen = self._own_board = ""
         self._view = None
         self._resort_tried.clear()
@@ -2009,6 +2408,8 @@ class AutotypeApp:
             self._toggle_arm()
         elif key == "PAUSE":
             self._toggle_pause()
+        elif key == "PERFORMANCE":
+            self._toggle_performance()
         elif key == "CASUAL":
             self._set_mode("casual")
         elif key == "PRO":

@@ -67,6 +67,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 @property (nonatomic, strong) NSTextField *trapLabel;
 @property (nonatomic, strong) NSButton *armButton;
 @property (nonatomic, strong) NSButton *pauseButton;
+@property (nonatomic, strong) NSButton *performanceButton;
 @property (nonatomic, strong) NSButton *confirmButton;
 @property (nonatomic, strong) NSTextField *addField;
 @property (nonatomic, strong) NSTextField *searchField;
@@ -102,7 +103,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
                                                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskNonactivatingPanel
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
-    self.window.title = @"eschaton v4.8";
+    self.window.title = @"eschaton v4.9";
     self.window.delegate = self;
     self.window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     self.window.backgroundColor = inkColor();
@@ -118,7 +119,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     self.usedLabel.alignment = NSTextAlignmentRight;
     [root addSubview:self.usedLabel];
 
-    NSTextField *title = label(@"eschaton v4.8", 22, boneColor(), NO);
+    NSTextField *title = label(@"eschaton v4.9", 22, boneColor(), NO);
     title.frame = NSMakeRect(18, 730, 280, 30);
     [root addSubview:title];
 
@@ -237,6 +238,8 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     for (NSView *view in @[pCap, self.promptLabel, cCap, self.choice1, self.choice2, self.choice3, typeCap, self.typeLabel, trapCap, self.trapLabel]) {
         [card addSubview:view];
     }
+    self.performanceButton = [self button:@"HIGH PERFORMANCE: OFF" action:@selector(performance:) frame:NSMakeRect(16, 18, 350, 32) bg:inkColor() fg:boneColor()];
+    [card addSubview:self.performanceButton];
 
     self.armButton = [self button:@"ARM" action:@selector(arm:) frame:NSMakeRect(18, 162, 124, 36) bg:cardColor() fg:boneColor()];
     self.pauseButton = [self button:@"PAUSE" action:@selector(pause:) frame:NSMakeRect(148, 162, 124, 36) bg:cardColor() fg:boneColor()];
@@ -319,6 +322,10 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
     else if ([key isEqualToString:@"ARMED"]) [self showArmed:[value isEqualToString:@"1"]];
     else if ([key isEqualToString:@"ARMLABEL"]) styleButton(self.armButton, value, self.armed ? boneColor() : cardColor(), self.armed ? inkColor() : boneColor());
     else if ([key isEqualToString:@"PAUSELABEL"]) styleButton(self.pauseButton, value, cardColor(), boneColor());
+    else if ([key isEqualToString:@"PERFORMANCE"]) {
+        BOOL high = [value isEqualToString:@"1"];
+        styleButton(self.performanceButton, high ? @"HIGH PERFORMANCE: ON" : @"HIGH PERFORMANCE: OFF", high ? boneColor() : inkColor(), high ? inkColor() : boneColor());
+    }
     else if ([key isEqualToString:@"STYLE"]) self.kicker.stringValue = value.length ? value : @"DYOE   ·   FEATHERINE";
     else if ([key isEqualToString:@"SEARCHTEXT"] && ![self.searchField.stringValue isEqualToString:value]) self.searchField.stringValue = value ?: @"";
     else if ([key isEqualToString:@"ADDTEXT"]) self.addField.stringValue = value ?: @"";
@@ -402,6 +409,7 @@ static void styleButton(NSButton *button, NSString *title, NSColor *bg, NSColor 
 
 - (void)arm:(id)sender { [self send:@"ARM"]; }
 - (void)pause:(id)sender { [self send:@"PAUSE"]; }
+- (void)performance:(id)sender { [self send:@"PERFORMANCE"]; }
 - (void)casual:(id)sender { [self send:@"CASUAL"]; }
 - (void)pro:(id)sender { [self send:@"PRO"]; }
 - (void)spam:(id)sender { [self send:@"SPAM"]; }

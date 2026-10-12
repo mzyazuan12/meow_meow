@@ -11,6 +11,7 @@ _CG.CGEventCreateKeyboardEvent.restype = c_void_p
 _CG.CGEventCreateKeyboardEvent.argtypes = [c_void_p, c_uint16, c_int]
 _CG.CGEventPost.argtypes = [c_uint32, c_void_p]
 _CG.CGEventSetFlags.argtypes = [c_void_p, c_uint32]
+_CG.CGEventKeyboardSetUnicodeString.argtypes = [c_void_p, ctypes.c_ulong, ctypes.POINTER(c_uint16)]
 
 _HID = 0
 _FLAG_SHIFT = 1 << 17
@@ -53,7 +54,7 @@ _DELETE = 0x33
 _CF = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 _CF.CFRelease.argtypes = [c_void_p]
 
-def _post(keycode: int, down: bool, flags: int = 0) -> None:
+def _post(keycode: int, down: bool, flags: int = 0, text: str = "") -> None:
     if hasattr(_CG, "CGPreflightPostEventAccess"):
         _CG.CGPreflightPostEventAccess.restype = ctypes.c_bool
         if not _CG.CGPreflightPostEventAccess():
@@ -63,6 +64,12 @@ def _post(keycode: int, down: bool, flags: int = 0) -> None:
         raise OSError("macOS couldn't create a keyboard event")
     if flags:
         _CG.CGEventSetFlags(event, c_uint32(flags))
+    if text:
+        # Key codes are US positions; on another layout the same key types
+        # another character ("ß" for "-" on German), so the text rides along.
+        units = text.encode("utf-16-le")
+        chars = (c_uint16 * (len(units) // 2)).from_buffer_copy(units)
+        _CG.CGEventKeyboardSetUnicodeString(event, len(chars), chars)
     _CG.CGEventPost(c_uint32(_HID), event)
     _CF.CFRelease(event)
 
@@ -87,11 +94,11 @@ def tap_key(kind: str, key: str, hold: float = 0.008) -> None:
     if code is None:
         raise ValueError(f"Unsupported typing character: {ch!r}")
     flags = _FLAG_SHIFT if ch.isalpha() and ch.isupper() else 0
-    _post(code, True, flags)
+    _post(code, True, flags, ch)
     try:
         time.sleep(max(0.020, hold))
     finally:
-        _post(code, False, flags)
+        _post(code, False, flags, ch)
 
 def press_enter() -> None:
     _post(_RETURN, True)

@@ -13,7 +13,7 @@ from PIL import Image
 from autotype.featherine import edit_plan, plan_duration, turn_plan
 from autotype.session import MatchSession, max_suffix_for
 from autotype.test_regressions import app_module, frame, make_app
-from autotype.timer import TurnClock, read_alert, read_clock
+from autotype.timer import HEADER_LAG, TurnClock, read_alert, read_clock
 from dyoe2_engine import Dyoe2Engine, TrapPools
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -28,13 +28,29 @@ def session(words, **pools):
 class DynamicTrapTests(unittest.TestCase):
     def test_a_trap_is_found_from_the_dictionary_without_any_list(self):
         s = session(["preqzk", "prefoobar", "qzkaaaaaaa"])  # no trap lists at all
+        s.set_mode("pro")
         self.assertEqual(s.choose("pre")[0], "preqzk")
         self.assertEqual(s._choice_traps["preqzk"], "qzk")
 
     def test_few_and_long_beats_many_and_short(self):
         words = ["preabc", "prexyz", "abcd", "abce", "abcf", "abcg", "xyzqqqqqqqq"]
         s = session(words)
+        s.set_mode("pro")
         self.assertEqual(s.choose("pre")[0], "prexyz")
+
+    def test_casual_uses_the_fewest_groups_of_at_least_three_and_skips_self_solves(self):
+        # fs is one group, rv is two. ary is three, so casual hands ary.
+        words = ["preary", "prefs", "prerv", "arya", "aryb", "aryc", "fsaaa", "rva", "rvb",
+                 "xyza", "xyzb", "xyzc", "xyzd", "prexyz"]
+        s = session(words)
+        s.set_mode("casual")
+        self.assertEqual(s.choose("pre")[0], "preary")
+        self.assertEqual(s._choice_traps["preary"], "ary")
+        # A prefix that is itself an unused word is answered by pressing Enter.
+        solved = session(words + ["ary"])
+        solved.set_mode("casual")
+        self.assertNotEqual(solved.choose("pre")[0], "preary")
+        self.assertNotIn("ary", solved._choice_traps.values())
 
     def test_a_blacklisted_ending_is_never_a_trap(self):
         s = session(["prebj", "bjaaaaaaaa", "prexyq", "xyqaa"])
@@ -46,6 +62,7 @@ class DynamicTrapTests(unittest.TestCase):
         words += [f"{a}{b}{c}" + "t" * n for a in "klmnpqrstvz" for b in "aeiouy" for c in "bdfgkx"
                   for n in (2, 5)]
         s = session(words)
+        s.set_mode("pro")
         seen, firsts = set(), set()
         for _ in range(10):
             s.new_game()
@@ -58,6 +75,34 @@ class DynamicTrapTests(unittest.TestCase):
             self.assertLessEqual(len(remaining), 2, (word, trap))
         self.assertGreater(len(seen), 4)
         self.assertGreater(len(firsts), 1)
+
+    def test_each_game_picks_its_own_trap_among_the_deadliest(self):
+        # Six endings leave one answer each, of slightly different lengths;
+        # abc leaves ten.
+        endings = ["qzk", "vjx", "wfb", "kpz", "xjq", "zvw"]
+        words = [f"pre{e}" for e in endings]
+        words += [e + "a" * (7 + i % 3) for i, e in enumerate(endings)]
+        words += ["preabc"] + [f"abc{c}aaaaaa" for c in "bcdefghijk"]
+        s = session(words)
+        s.set_mode("pro")
+        traps = []
+        with patch("autotype.session.random.SystemRandom", return_value=random.Random(7)):
+            for _ in range(12):
+                s.new_game()
+                traps.append(s._choice_traps.get(s.choose("pre")[0]))
+        self.assertNotIn("abc", traps)
+        self.assertGreater(len(set(traps)), 3)
+
+    def test_long_answers_never_make_a_crowded_ending_the_trap(self):
+        # qzk leaves three short next-letter groups, vjx eight of long words.
+        words = ["preqzk", "prevjx"] + [f"qzk{c}" for c in "abc"]
+        words += [f"vjx{c}" + "o" * 18 for c in "abcdefgh"]
+        s = session(words)
+        s.set_mode("casual")
+        with patch("autotype.session.random.SystemRandom", return_value=random.Random(3)):
+            for _ in range(8):
+                s.new_game()
+                self.assertEqual(s.choose("pre")[0], "preqzk", s.style.label)
 
     def test_search_does_not_disturb_the_live_turn(self):
         s = session(["stone", "stoke", "stow"])
@@ -73,6 +118,7 @@ class TrapChoiceTests(unittest.TestCase):
     def test_a_prefix_is_never_handed_over_more_times_than_it_has_solves(self):
         s = session(["preols", "preaols", "prebols", "prexabc", "preyabc", "prefoobar", "olsa", "olsb",
                      "abca", "abcb", "abcc"], casual_3=["ols", "abc"])
+        s.set_mode("pro")
         # ols has two solves, abc three: fewest first.
         played = []
         for _ in range(5):
@@ -87,7 +133,8 @@ class TrapChoiceTests(unittest.TestCase):
         self.assertEqual(s.given["ols"], 2)
 
     def test_a_trap_that_is_itself_an_unused_word_is_not_a_trap(self):
-        s = session(["preols", "prexyz", "ols", "olsa", "xyza", "xyzb", "xyzc"], casual_3=["ols", "xyz"])
+        s = session(["preols", "prexyz", "ols", "olsaaaaa", "olsbbbbb", "olsccccc",
+                     "xyza", "xyzb", "xyzc"], casual_3=["ols", "xyz"])
         self.assertEqual(s.choose("pre")[0], "prexyz")
         s.engine.mark_used("ols")
         self.assertEqual(s.choose("pre")[0], "preols")
@@ -118,6 +165,7 @@ class TrapChoiceTests(unittest.TestCase):
 
     def test_equal_solve_counts_prefer_the_trap_with_longer_solves(self):
         s = session(["preabc", "prexyz", "abcd", "xyzlongword"], casual_3=["abc", "xyz"])
+        s.set_mode("pro")
         self.assertEqual(s.choose("pre")[0], "prexyz")
 
     def test_opponents_real_prompt_replaces_the_assumed_one(self):
@@ -143,7 +191,7 @@ class TrapChoiceTests(unittest.TestCase):
         self.assertEqual(s.choose("a")[0], "abcd")
 
     def test_spam_tries_the_typed_endings_first_then_deadly_traps(self):
-        s = session(["xpring", "xprinking", "xpred", "xprexyz", "xprolong", "xyzaa"],
+        s = session(["xpring", "xprinking", "xpred", "xprexyz", "xprolong", "xyzaa", "xyzbb", "xyzcc"],
                     casual_3=["xyz"])
         s.set_spam_suffixes("ing, ed")
         s.set_mode("spam")
@@ -380,7 +428,8 @@ class ClockTests(unittest.TestCase):
         self.assertEqual(clock.total, 5.0)
         self.assertAlmostEqual(clock.remaining(100.7), 0.86 * 5, delta=0.05)
         clock.start_turn(200)
-        self.assertAlmostEqual(clock.remaining(203), 2.0, delta=0.01)
+        # The clock restarted when the last word was accepted, before the header changed.
+        self.assertAlmostEqual(clock.remaining(203), 2.0 - HEADER_LAG, delta=0.01)
         clock.observe(3.0, None, 205)
         self.assertAlmostEqual(clock.remaining(205.5), 2.5, delta=0.01)
 
@@ -391,7 +440,7 @@ class AppTurnTests(unittest.TestCase):
         app._start_typing = app_module.AutotypeApp._start_typing.__get__(app)
         budgets = []
         with patch.object(app, "_time_left", return_value=3.0), \
-             patch.object(app_module, "turn_plan", side_effect=lambda s, p, b, is_word=None: budgets.append((s, b))
+             patch.object(app_module, "turn_plan", side_effect=lambda s, p, b, is_word=None, **kwargs: budgets.append((s, b))
                           or edit_plan("", s)), \
              patch.object(app, "_launch_typing"):
             app._start_typing("pre")
@@ -401,6 +450,7 @@ class AppTurnTests(unittest.TestCase):
         app, _ = make_app(("abtone", "oneself", "neat"))
         app._name = "player"
         app._typing_prompt = app.watch.played = "ab"
+        app._last_frame = frame("abtone")
         with patch.object(app_module, "press_enter"):
             app._process_event("SUBMIT", (app._gen, "abtone", 4))
         app._handle_frame(frame("one", "opponent"))

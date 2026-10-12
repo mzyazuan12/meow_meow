@@ -53,7 +53,7 @@ def make_app(words=('stone', 'star', 'mhorr', 'mhos', 'rabbit', 'nesting')):
 
 def frame(board, speaker='player', full=True, error=''):
     return {'prompt': board, 'header': f'{speaker}, type an english word starting with:',
-            'tiles': len(board), 'full': full, 'error': error}
+            'tiles': len(board), 'full': full, 'error': error, 'captured_at': time.monotonic()}
 
 
 class TurnRegressionTests(unittest.TestCase):
@@ -398,7 +398,7 @@ class CaptureRegressionTests(unittest.TestCase):
             readings.append(reading)
             if len(readings) == 2:
                 stop.set()
-        with patch.object(host, "_grab", return_value=(bytes(10 * 10 * 4), 10, 10)), \
+        with patch.object(host, "_grab", return_value=(bytes(10 * 10 * 4), 10, 10, 1.0)), \
              patch.object(host.sys, "platform", "darwin"), \
              patch("autotype.tiles.scan_rgba", side_effect=[ValueError("transition frame"), frame("ism")]):
             _run_portable(stop, received, statuses.append, lambda: "player")

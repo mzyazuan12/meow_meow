@@ -66,11 +66,16 @@ def _components(light: np.ndarray, dark: np.ndarray, min_area: int, keep=None) -
 
 def _digit_glyphs(face: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], Optional[np.ndarray]]]:
     """Outlined characters inside a face crop, left to right, with features."""
-    height = face.shape[0]
+    height, width = face.shape[:2]
     light, dark = _fill_masks(face)
+    # The face crop's corners show the arc outside the circle. A corner piece
+    # as tall as a digit would stretch the line and squash every glyph. A dark
+    # line inside a narrow 1 thins its outline ring, hence the lower bar.
     pieces = [c for c in _components(light & ~_face_white(face), dark, 3)
-              if c["ring"] >= 0.4 and c["box"][0] > 0 and c["box"][1] > 0
-              and c["box"][3] - c["box"][1] <= height * 0.6]
+              if c["ring"] >= 0.3 and c["box"][0] > 0 and c["box"][1] > 0
+              and c["box"][2] < width and c["box"][3] < height
+              and c["box"][3] - c["box"][1] <= height * 0.6
+              and abs((c["box"][1] + c["box"][3]) / 2 - height / 2) < height * 0.3]
     if not pieces:
         return []
     tall = max(c["box"][3] - c["box"][1] for c in pieces)
@@ -78,6 +83,8 @@ def _digit_glyphs(face: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], Opt
     pieces = [c for c in pieces if c["box"][3] - c["box"][1] >= tall * 0.15
               and c["box"][2] - c["box"][0] >= max(3, tall * 0.15)]
     digits = [c for c in pieces if c["box"][3] - c["box"][1] >= tall * 0.7]
+    if not digits:
+        return []
     top = min(c["box"][1] for c in digits)
     line_h = max(1, max(c["box"][3] for c in digits) - top)
     pieces.sort(key=lambda c: c["box"][0])
@@ -97,18 +104,24 @@ def _read_digits(face: np.ndarray) -> Optional[float]:
     if loaded is None:
         return None
     labels, features = loaded
-    height = face.shape[0]
     text = ""
+    previous = None
     for box, feature in _digit_glyphs(face):
-        if abs((box[1] + box[3]) / 2 - height / 2) >= height * 0.3:
-            continue
         if feature is None:
-            text += "?"
-            continue
-        scores = features @ feature
-        best = int(scores.argmax())
-        text += labels[best] if scores[best] >= TIMER_MIN_SCORE else "?"
-    if not re.fullmatch(r"\d{1,2}\.\ds?", text):
+            char = "?"
+        else:
+            scores = features @ feature
+            best = int(scores.argmax())
+            char = labels[best] if scores[best] >= TIMER_MIN_SCORE else "?"
+        # The clock hand often covers the decimal point. Digits sit a sixth of
+        # their height apart; the point leaves about half a digit between them.
+        if (previous is not None and char.isdigit() and text[-1:].isdigit()
+                and box[0] - previous[2] > (box[3] - box[1]) * 0.35):
+            text += "."
+        text += char
+        previous = box
+    # Whole seconds drop the decimal ("13s"); a bare number needs its s.
+    if not re.fullmatch(r"\d{1,2}\.\ds?|\d{1,2}s", text):
         return None
     value = float(text.rstrip("s"))
     return value if value <= 20 else None
@@ -118,17 +131,16 @@ def _arc_fraction(rgb: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[f
     x0, y0, x1, y1 = box
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     radius = (x1 - x0 + y1 - y0) / 4
-    r, g, b, _lo, _hi = _channels(rgb)
-    # Cream, yellow and orange arcs; the red carpet and blue-white desk are not.
-    arc = (r > 190) & (g > 100) & (r - b >= 14)
-    height, width = arc.shape
+    height, width = rgb.shape[:2]
     angles = np.arange(ARC_SAMPLES) / ARC_SAMPLES * 2 * np.pi
     scales = np.linspace(1.0, 1.45, 10)
     xs = np.rint(cx + np.sin(angles)[:, None] * radius * scales[None, :]).astype(int)
     ys = np.rint(cy - np.cos(angles)[:, None] * radius * scales[None, :]).astype(int)
     inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+    r, g, b, _lo, _hi = _channels(rgb[ys[inside], xs[inside]])
     hit = np.zeros(xs.shape, bool)
-    hit[inside] = arc[ys[inside], xs[inside]]
+    # Cream, yellow and orange arcs; the red carpet and blue-white desk are not.
+    hit[inside] = (r > 190) & (g > 100) & (r - b >= 14)
     hits = hit.any(axis=1).tolist()
     if sum(hits) < 3:
         return None
@@ -186,7 +198,7 @@ def read_clock(rgb: np.ndarray) -> dict:
 def read_alert(rgb: np.ndarray) -> bool:
     """Whether red outlined banner text ("Already used!") is under the table."""
     height, width = rgb.shape[:2]
-    band = rgb[int(height * 0.8):int(height * 0.99), int(width * 0.28):int(width * 0.72)].astype(np.int16)
+    band = rgb[int(height * 0.8):int(height * 0.99), int(width * 0.28):int(width * 0.72)]
     if band.size == 0:
         return False
     r, g, b = band[..., 0], band[..., 1], band[..., 2]
@@ -205,10 +217,27 @@ def read_alert(rgb: np.ndarray) -> bool:
     return max(box[2] for box in boxes) - min(box[0] for box in boxes) >= band.shape[1] * 0.3
 
 
+# A read further than this from the deadline is held back. It replaces the
+# deadline only once others have agreed with it for SWITCH_AFTER seconds: a
+# new turn or a time bonus lasts, a digit hidden behind the hand does not.
+DEADLINE_TOLERANCE = 0.6
+SWITCH_AFTER = 0.3
+# For about a second after a turn starts the face animates, and the arc reads
+# near empty before it sweeps back to full. Arc reads count once it is full.
+ARC_REFILLED = 0.75
+ARC_SETTLE = 1.5
+# The clock restarts as the last word is accepted; the header names the next
+# player about this much later.
+HEADER_LAG = 0.4
+
+
 class TurnClock:
     """Seconds left in the current turn from digit reads and the shrinking arc.
 
     A turn lasts 15, 10, 7, 5 or 3 seconds depending on the stage of the match.
+    Every changed read predicts when the turn ends, and predictions that agree
+    refine that deadline. A repeated read is not new evidence, so a frozen face
+    never grants more time.
     """
 
     def __init__(self) -> None:
@@ -220,13 +249,35 @@ class TurnClock:
         self._samples: List[Tuple[float, float]] = []
         self._deadline: Optional[float] = None
         self._deadline_at = 0.0
+        self._confirmed = False
         self._turn_at: Optional[float] = None
+        self._rivals: List[Tuple[float, float]] = []
+        self._arc_ready = True
         self._last_frac: Optional[float] = None
+        self._last_frac_at = 0.0
         self._last_seconds: Optional[float] = None
 
-    def _new_turn(self) -> None:
-        self._samples = []
-        self._deadline = None
+    def _predict(self, deadline: float, at: float, weight: float) -> bool:
+        """Fold in one predicted deadline; True when the clock accepts it."""
+        if self._deadline is not None and abs(deadline - self._deadline) <= DEADLINE_TOLERANCE:
+            self._deadline += weight * (deadline - self._deadline)
+            self._deadline_at = at
+            self._confirmed = True
+            self._rivals = []
+            return True
+        if self._deadline is None or not self._confirmed:
+            # Nothing to check a lone read against: the next one confirms or replaces it.
+            self._deadline, self._deadline_at = deadline, at
+            self._confirmed = False
+            self._rivals = []
+            return True
+        self._rivals = [r for r in self._rivals if abs(r[1] - deadline) <= DEADLINE_TOLERANCE] + [(at, deadline)]
+        if len(self._rivals) < 3 or at - self._rivals[0][0] < SWITCH_AFTER:
+            return False
+        self._deadline = sorted(r[1] for r in self._rivals)[len(self._rivals) // 2]
+        self._deadline_at = at
+        self._rivals = []
+        return True
 
     def _learn(self, estimate: float) -> None:
         if not 1.0 <= estimate <= 20.0:
@@ -238,39 +289,49 @@ class TurnClock:
         self.total = sorted(self._estimates)[len(self._estimates) // 2]
 
     def observe(self, seconds: Optional[float], frac: Optional[float], at: float) -> None:
-        if frac is not None and self._last_frac is not None and frac > self._last_frac + 0.12:
-            self._new_turn()
-        elif seconds is not None and self._last_seconds is not None and seconds > self._last_seconds + 0.8:
-            self._new_turn()
-        if frac is not None:
-            self._last_frac = frac
-            self._samples = [s for s in self._samples if at - s[0] <= 4.0] + [(at, frac)]
+        old_frac = self._last_frac
+        if frac is not None and not self._arc_ready:
+            self._arc_ready = (frac >= ARC_REFILLED or self._turn_at is None
+                               or at - self._turn_at >= ARC_SETTLE)
+            old_frac = None
+        arc = frac if self._arc_ready else None
+        if arc is not None:
+            # Even a 3 s turn empties the arc at only a third per second. A
+            # bigger jump either way is a new turn, a bonus or the animation.
+            if old_frac is not None and abs(arc - old_frac) > (at - self._last_frac_at) * 0.4 + 0.05:
+                self._samples = []
+            self._last_frac, self._last_frac_at = arc, at
+            self._samples = [s for s in self._samples if at - s[0] <= 4.0] + [(at, arc)]
             if len(self._samples) >= 4 and self._samples[-1][0] - self._samples[0][0] >= 0.6:
                 ts = np.array([s[0] for s in self._samples])
                 fs = np.array([s[1] for s in self._samples])
                 slope = float(np.polyfit(ts - ts[0], fs, 1)[0])
                 if slope < 0:
                     self._learn(-1.0 / slope)
+        digits = False
         if seconds is not None:
+            digits = seconds == self._last_seconds or self._predict(at + seconds, at, 0.5)
+            if seconds != self._last_seconds:
+                if digits and arc is not None and arc > 0.15:
+                    self._learn(seconds / arc)
+                elif self.total is None:
+                    self._learn(min((s for s in STAGES if s >= seconds), default=STAGES[0]))
             self._last_seconds = seconds
-            if frac is not None and frac > 0.15:
-                self._learn(seconds / frac)
-            elif self.total is None:
-                self._learn(min((s for s in STAGES if s >= seconds), default=STAGES[0]))
-            self._deadline, self._deadline_at = at + seconds, at
-        elif frac is not None and self.total is not None:
-            self._deadline, self._deadline_at = at + frac * self.total, at
+        if not digits and arc is not None and arc != old_frac and self.total is not None:
+            self._predict(at + arc * self.total, at, 0.25)
 
     def start_turn(self, at: float) -> None:
         self._turn_at = at
+        self._arc_ready = False
+        self._rivals = []
         if self._deadline is not None and self._deadline_at < at - 0.05:
             self._deadline = None
 
     def remaining(self, now: float) -> Optional[float]:
-        if self._deadline is not None and now - self._deadline_at <= 2.0:
+        if self._deadline is not None:
             return self._deadline - now
         if self.total is not None and self._turn_at is not None:
-            return self.total - (now - self._turn_at)
+            return self.total - (now - self._turn_at) - HEADER_LAG
         return None
 
 

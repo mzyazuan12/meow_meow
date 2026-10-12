@@ -71,9 +71,12 @@ def _area_matrix(n_in: int, n_out: int) -> np.ndarray:
 
 def blur(a: np.ndarray) -> np.ndarray:
     """Separable [1 2 1]/4 blur with zero padding."""
-    p = np.pad(a, ((1, 1), (0, 0)))
+    h, w = a.shape
+    p = np.zeros((h + 2, w), a.dtype)
+    p[1:-1] = a
     a = (p[:-2] + 2 * p[1:-1] + p[2:]) * 0.25
-    p = np.pad(a, ((0, 0), (1, 1)))
+    p = np.zeros((h, w + 2), a.dtype)
+    p[:, 1:-1] = a
     return (p[:, :-2] + 2 * p[:, 1:-1] + p[:, 2:]) * 0.25
 
 
@@ -127,6 +130,11 @@ def tile_feature(rgb: np.ndarray) -> Optional[np.ndarray]:
     Pieces of the tile's own border/corners touch the crop edge and are dropped,
     so only the letter outline is compared, independent of tile size.
     """
+    glyph = _tile_glyph(rgb)
+    return None if glyph is None else _square_feature(glyph)
+
+
+def _tile_glyph(rgb: np.ndarray) -> Optional[np.ndarray]:
     if rgb.shape[0] < 6 or rgb.shape[1] < 6:
         return None
     work = area_resize(ink_of(rgb), TILE_WORK, TILE_WORK)
@@ -152,11 +160,15 @@ def tile_feature(rgb: np.ndarray) -> Optional[np.ndarray]:
     ys, xs = np.nonzero(keep)
     y0, y1 = max(0, int(ys.min()) - 1), min(TILE_WORK, int(ys.max()) + 2)
     x0, x1 = max(0, int(xs.min()) - 1), min(TILE_WORK, int(xs.max()) + 2)
-    bw, bh = x1 - x0, y1 - y0
+    return glyph[y0:y1, x0:x1]
+
+
+def _square_feature(glyph: np.ndarray) -> Optional[np.ndarray]:
+    bh, bw = glyph.shape
     side = max(bw, bh)
     square = np.zeros((side, side), np.float32)
     oy, ox = (side - bh) // 2, (side - bw) // 2
-    square[oy:oy + bh, ox:ox + bw] = glyph[y0:y1, x0:x1]
+    square[oy:oy + bh, ox:ox + bw] = glyph
     return _normalize(blur(blur(area_resize(square, TILE_GRID, TILE_GRID))))
 
 
@@ -185,15 +197,27 @@ class Templates:
         self._tile_index = np.array([self._tile_letters.index(c) for c in tile_labels], np.int64)
         self._head_letters = sorted(set(head_labels))
         self._head_index = np.array([self._head_letters.index(c) for c in head_labels], np.int64)
+        by_letter = np.argsort(self._tile_index, kind="stable")
+        self._tile_sorted = np.ascontiguousarray(tile[by_letter])
+        self._tile_starts = np.searchsorted(self._tile_index[by_letter], np.arange(len(self._tile_letters)))
 
     def classify_tile(self, feature: Optional[np.ndarray]) -> Tuple[str, float, float]:
-        if feature is None:
-            return "", 0.0, 0.0
-        best = np.full(len(self._tile_letters), -1.0, np.float32)
-        np.maximum.at(best, self._tile_index, self.tile @ feature)
-        order = np.argsort(-best)
-        top, second = float(best[order[0]]), float(best[order[1]])
-        return self._tile_letters[int(order[0])], top, top - second
+        return self.classify_tiles([feature])[0]
+
+    def classify_tiles(self, features: Sequence[Optional[np.ndarray]]) -> List[Tuple[str, float, float]]:
+        """classify_tile for several features with one template product."""
+        out: List[Tuple[str, float, float]] = [("", 0.0, 0.0)] * len(features)
+        present = [i for i, feature in enumerate(features) if feature is not None]
+        if not present:
+            return out
+        scores = self._tile_sorted @ np.stack([features[i] for i in present], axis=1)
+        best = np.maximum.reduceat(scores, self._tile_starts, axis=0)
+        for column, i in enumerate(present):
+            letter_scores = best[:, column]
+            order = np.argsort(-letter_scores)
+            top, second = float(letter_scores[order[0]]), float(letter_scores[order[1]])
+            out[i] = (self._tile_letters[int(order[0])], top, top - second)
+        return out
 
     def classify_head(self, feature: Optional[np.ndarray]) -> Tuple[str, float]:
         if feature is None:
@@ -216,14 +240,15 @@ def templates() -> Templates:
 
 def read_tile(rgb: np.ndarray) -> str:
     """One lowercase letter, or "" when the glyph isn't clear enough to trust."""
-    feature = tile_feature(rgb)
-    if feature is None:
+    glyph = _tile_glyph(rgb)
+    if glyph is None:
         return ""
-    t = templates()
-    letter, score, margin = t.classify_tile(feature)
-    alternatives = [(letter, score, margin)]
-    for transformed in (rgb[::-1, ::-1], rgb[:, ::-1], rgb[::-1]):
-        alternatives.append(t.classify_tile(tile_feature(transformed)))
+    # Flipping the tile flips the extracted outline exactly, so only the final
+    # squaring step is repeated for the rotated, mirrored and flipped readings.
+    features = [_square_feature(g) for g in (glyph, glyph[::-1, ::-1], glyph[:, ::-1], glyph[::-1])]
+    if features[0] is None:
+        return ""
+    alternatives = templates().classify_tiles(features)
     letter, score, margin = max(alternatives, key=lambda item: item[1])
     return letter if score >= TILE_MIN_SCORE and margin >= TILE_MIN_MARGIN else ""
 

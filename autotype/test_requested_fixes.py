@@ -108,6 +108,7 @@ class RequestedFixTests(unittest.TestCase):
         app, _ = make_app(('king',))
         app._name = 'player'
         app._typing_prompt = app.watch.played = 'king'
+        app._last_frame = frame('king')
         with patch.object(app_module, 'press_enter') as enter:
             app._process_event('SUBMIT', (app._gen, 'king', 0))
             enter.assert_called_once()
@@ -130,7 +131,7 @@ class RequestedFixTests(unittest.TestCase):
 
     def test_fewest_solves_and_no_unused_self_solve(self):
         traps = TrapPools(casual_3=['abc', 'xyz'], pro_3=['abc', 'xyz'])
-        words = ['preabc', 'prexyz', 'abc', 'abcd', 'xyza']
+        words = ['preabc', 'prexyz', 'abc', 'abcd', 'xyza', 'xyzb', 'xyzc']
         for mode in ('casual', 'pro', 'spam'):
             s = MatchSession(Dyoe2Engine(words, traps, validate_giveable=False))
             s.set_mode(mode)
@@ -188,13 +189,17 @@ class RequestedFixTests(unittest.TestCase):
 
     def test_easy_plural_traps_come_after_harder_ones_until_those_run_out(self):
         pools = TrapPools(casual_3=['abc', 'xyz'], pro_3=['abc', 'xyz'])
-        for mode in ('casual', 'pro'):
-            s = MatchSession(Dyoe2Engine(['preabc', 'prexyz', 'abcs', 'xyza', 'xyzb'], pools, validate_giveable=False))
-            s.set_mode(mode)
-            self.assertEqual(s.choose('pre')[0], 'prexyz')
-            # Two hand-overs of xyz have used both of its solves.
-            s.given['xyz'] = 2
-            self.assertEqual(s.choose('pre')[0], 'preabc')
+        s = MatchSession(Dyoe2Engine(['preabc', 'prexyz', 'abcs', 'xyza', 'xyzb'], pools, validate_giveable=False))
+        s.set_mode('pro')
+        self.assertEqual(s.choose('pre')[0], 'prexyz')
+        # Two hand-overs of xyz have used both of its solves.
+        s.given['xyz'] = 2
+        self.assertEqual(s.choose('pre')[0], 'preabc')
+        casual = MatchSession(Dyoe2Engine(
+            ['preary', 'prexyz', 'arya', 'aryb', 'aryc', 'arys', 'xyza', 'xyzb', 'xyzc', 'xyzd'],
+            pools, validate_giveable=False))
+        casual.set_mode('casual')
+        self.assertEqual(casual.choose('pre')[0], 'preary')
 
     def test_trap_counts_exclude_the_word_we_are_about_to_use(self):
         pools = TrapPools(casual_3=['abc', 'xyz'])
@@ -305,9 +310,11 @@ class RequestedFixTests(unittest.TestCase):
         app, face = make_app(('stone', 'nest'))
         app._name = 'player'
         app._handle_frame(frame('s'))
+        app._handle_frame(frame('s'))
         self.assertIn('stone', face.values['C1'])
         app._handle_frame(frame('????', full=False))
         self.assertEqual(face.values['C1'], '—')
+        app._handle_frame(frame('n'))
         app._handle_frame(frame('n'))
         self.assertIn('nest', face.values['C1'])
 
